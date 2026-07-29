@@ -10,9 +10,10 @@ requires-python = ">=3.10"
 
 dependencies = [
     "xxhash",
-    "vllm>=0.7.2",
     "fastapi",
     "uvicorn[standard]",
+    "httpx",
+    "transformers",
     "pydantic>=2.0",
     "sse-starlette>=2.0",
 ]

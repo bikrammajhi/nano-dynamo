@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .prefill import DisaggregatedRouter
-from .types import WorkerId, WorkerLoad
+from .types import LocalBlockHash, WorkerId, WorkerLoad
 from .radix_tree import (
     KvIndexer, RouterEvent, KvCacheEvent, KvCacheEventData,
     KvCacheStoredBlockData, ExternalSequenceBlockHash,
@@ -122,7 +122,7 @@ class KvRouterGateway:
 
         self._req_counter = 0
         self._req_worker: Dict[str, int] = {}
-        self._req_tokens: Dict[str, List[int]] = {}
+        self._req_block_hashes: Dict[str, List[LocalBlockHash]] = {}
 
         log.info("Gateway: %d prefill + %d decode workers, block_size=%d", len(prefill_urls), len(decode_urls), block_size)
 
@@ -130,7 +130,11 @@ class KvRouterGateway:
         return {WorkerId(wid): ws.to_worker_load(wid) for wid, ws in self.prefill_states.items()}
 
     def _route(self, body: dict) -> tuple[str, str]:
-        """Route request → (prefill_url, request_id)."""
+        """Route request → (prefill_url, request_id).
+
+        Update the radix tree optimistically at routing time, not at request
+        completion — so the next request sees blocks being computed right now.
+        """
         messages = body.get("messages", [])
         prompt = body.get("prompt", "")
         text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) if messages else prompt
@@ -154,7 +158,23 @@ class KvRouterGateway:
         self._req_counter += 1
         req_id = f"req-{self._req_counter}"
         self._req_worker[req_id] = wid
-        self._req_tokens[req_id] = token_ids
+
+        # 3. Eagerly update the radix tree — blocks are being computed NOW on wid
+        block_hashes = compute_block_hash_for_seq(token_ids, self.block_size)
+        if block_hashes:
+            blocks = [
+                KvCacheStoredBlockData(tokens_hash=bh, block_hash=ExternalSequenceBlockHash(bh.value))
+                for bh in block_hashes
+            ]
+            event = RouterEvent(
+                worker_id=wid,
+                event=KvCacheEvent(
+                    event_id=self._req_counter,
+                    data=KvCacheEventData.stored(parent_hash=None, blocks=blocks),
+                ),
+            )
+            self.indexer.apply_event(event)
+            self._req_block_hashes[req_id] = block_hashes
 
         overlap = self.indexer.find_matches_for_request(token_ids)
         log.info("Route → prefill_%d (isl=%d, overlap=%d, remote=%s)",
@@ -163,29 +183,19 @@ class KvRouterGateway:
         return self.prefill_urls[wid], req_id
 
     def _complete(self, request_id: str):
-        """Commit blocks to BlockPool + update radix tree on request completion."""
+        """Commit blocks to BlockPool on request completion (evicts if full)."""
         wid = self._req_worker.pop(request_id, None)
-        token_ids = self._req_tokens.pop(request_id, None)
-        if wid is None or token_ids is None:
+        if wid is None:
             return
 
-        block_hashes = compute_block_hash_for_seq(token_ids, self.block_size)
+        block_hashes = self._req_block_hashes.pop(request_id, None)
         if not block_hashes:
             return
 
-        # Commit to BlockPool (evicts oldest blocks if full)
         pool = self.block_pools[wid]
         block_ids = pool.allocate(len(block_hashes))
         for bid, bh in zip(block_ids, block_hashes):
             pool.commit(bid, bh)
-
-        # Update radix tree
-        blocks = [KvCacheStoredBlockData(tokens_hash=bh, block_hash=ExternalSequenceBlockHash(bh.value)) for bh in block_hashes]
-        event = RouterEvent(
-            worker_id=wid,
-            event=KvCacheEvent(event_id=self._req_counter, data=KvCacheEventData.stored(parent_hash=None, blocks=blocks)),
-        )
-        self.indexer.apply_event(event)
 
     async def _update_loads(self):
         while True:
