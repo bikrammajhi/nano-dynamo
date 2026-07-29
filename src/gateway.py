@@ -1,38 +1,38 @@
-#!/usr/bin/env python3
-"""KV Router gateway — Dynamo-style routing for disaggregated prefill/decode.
+"""Nano-Dynamo: two-phase disaggregated proxy with KV-aware routing.
 
-Uses BlockPool + KvIndexer + KvScheduler from src/ for KV-aware routing,
-with HTTP proxy to external vLLM instances.
+PHASE 1: Disaggregated Prefill/Decode — route to independent P/D GPU pools.
+PHASE 2: KV-Aware Routing — route based on prefix cache overlap + load.
+PHASE 3: KVBM — KV Block Migration (track placement + decode selection)
+PHASE 4: Preemption & Promotion — LRU eviction, session promotion
+PHASE 5: Dynamic Pool Scaling — worker drain, rebalance, auto-scale
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 import threading
+import uuid
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
-
-import zmq
-import zmq.asyncio
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .prefill import DisaggregatedRouter
-from .types import LocalBlockHash, WorkerId, WorkerLoad
-from .radix_tree import (
-    KvIndexer, RouterEvent, KvCacheEvent, KvCacheEventData,
-    KvCacheStoredBlockData, ExternalSequenceBlockHash,
-    compute_block_hash_for_seq,
-)
-from .scheduler import KvScheduler, SchedulerConfig
-from .block_pool import BlockPool
+from .kv_events import token_ids_to_block_hashes
+from .kv_index import KvIndex, OverlapResult
+from .kvbm import MigrationManager
+from .preemption import PreemptionManager
+from .scaling import ScalingManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("kv-router")
+log = logging.getLogger("nano-dynamo")
+
+HTTP_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
 
 _tokenizer = None
 _tokenizer_lock = threading.Lock()
@@ -44,330 +44,497 @@ def _get_tokenizer(model_name: str):
         with _tokenizer_lock:
             if _tokenizer is None:
                 from transformers import AutoTokenizer
-                log.info("Loading tokenizer for %s...", model_name)
                 _tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     return _tokenizer
 
 
-# ── Worker state (metrics scraped from vLLM /metrics) ─────────────────
+# ── Scheduling policy (Phase 2: KV-aware) ──────────────────────────
 
 @dataclass
-class WorkerState:
-    url: str
-    active_requests: int = 0
-    kv_cache_used_blocks: int = 0
-    kv_cache_total_blocks: int = 100
+class ScheduleContext:
+    token_ids: List[int]
+    overlap: OverlapResult
+    worker_loads: Dict[int, int]
 
-    def to_worker_load(self, worker_id: int) -> WorkerLoad:
-        return WorkerLoad(
-            worker_id=WorkerId(worker_id),
-            active_requests=self.active_requests,
-            kv_cache_used_blocks=self.kv_cache_used_blocks,
-            kv_cache_total_blocks=self.kv_cache_total_blocks,
-        )
+class SchedulingPolicy(ABC):
+    @abstractmethod
+    def select(self, num_workers: int, ctx: Optional[ScheduleContext] = None) -> int:
+        ...
 
-    async def scrape_metrics(self):
-        try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.get(f"{self.url}/metrics")
-                if resp.status_code != 200:
-                    return
-                for line in resp.read().decode().split("\n"):
-                    if line.startswith("#") or not line.strip() or "{" in line:
-                        continue
-                    parts = line.split()
-                    if len(parts) < 2:
-                        continue
-                    if "num_requests_running" in line:
-                        self.active_requests = int(float(parts[1]))
-                    elif "gpu_cache_usage_perc" in line:
-                        self.kv_cache_used_blocks = int(float(parts[1]) * self.kv_cache_total_blocks)
-        except Exception:
-            pass
+class RoundRobinPolicy(SchedulingPolicy):
+    def __init__(self):
+        self._counter = 0
+
+    def select(self, num_workers: int, ctx: Optional[ScheduleContext] = None) -> int:
+        idx = self._counter % num_workers
+        self._counter += 1
+        return idx
+
+class KvAwarePolicy(SchedulingPolicy):
+    """Route to the prefill worker with highest KV cache overlap.
+
+    Falls back to round-robin when no overlap data is available.
+    """
+    def __init__(self):
+        self._rr = RoundRobinPolicy()
+
+    def select(self, num_workers: int, ctx: Optional[ScheduleContext] = None) -> int:
+        if ctx is None or not ctx.overlap.scores:
+            return self._rr.select(num_workers)
+
+        candidates = [(wid, score) for wid, score in ctx.overlap.scores.items() if wid < num_workers]
+        if not candidates:
+            return self._rr.select(num_workers)
+
+        best_idx, best_score = max(candidates, key=lambda x: x[1])
+        log.info("KV_ROUTE[overlap] worker=%d overlap_blocks=%d isl=%d",
+                 best_idx, best_score, len(ctx.token_ids))
+        return best_idx
 
 
-# ── Core gateway ──────────────────────────────────────────────────────
+# ── Two-phase proxy ────────────────────────────────────────────────
 
-class KvRouterGateway:
+class DisaggProxy:
     def __init__(
         self,
-        prefill_urls: List[str],
-        decode_urls: List[str],
-        model_name: str,
-        block_size: int = 64,
-        max_kv_blocks: int = 100,
-        max_local_prefill_length: int = 512,
-        kv_events_ports: Optional[List[int]] = None,
+        prefill_instances: list[str],
+        decode_instances: list[str],
+        model: str,
+        mode: str = "push",
+        prefill_engine_ids: Optional[list[str]] = None,
+        prefill_kv_host: str = "127.0.0.1",
+        prefill_side_channel_ports: Optional[list[int]] = None,
+        prefill_tp_size: int = 1,
+        prefill_pp_size: int = 1,
+        policy: Optional[SchedulingPolicy] = None,
+        block_size: int = 16,
+        decode_cache_capacity: int = 4096,
+        migration_threshold: float = 0.80,
+        preempt_threshold: float = 0.85,
+        preempt_batch: int = 1,
     ):
-        self.prefill_urls = prefill_urls
-        self.decode_urls = decode_urls
+        self.prefill_instances = prefill_instances
+        self.decode_instances = decode_instances
+        self.model = model
+        self.mode = mode
         self.block_size = block_size
-        self.model_name = model_name
-        self.kv_events_ports = kv_events_ports or []
+        self.policy = policy or KvAwarePolicy()
+        self.preempt_threshold = preempt_threshold
+        self.preempt_batch = preempt_batch
 
-        self.prefill_states = {i: WorkerState(url) for i, url in enumerate(prefill_urls)}
-        self.decode_states = {i: WorkerState(url) for i, url in enumerate(decode_urls)}
+        self.p_engine_ids = prefill_engine_ids or [f"prefill-{i}" for i in range(len(prefill_instances))]
+        self.p_side_ports = prefill_side_channel_ports or [5600 + i for i in range(len(prefill_instances))]
+        self.p_kv_host = prefill_kv_host
+        self.p_tp_size = prefill_tp_size
+        self.p_pp_size = prefill_pp_size
 
-        # Dynamo components
-        self.indexer = KvIndexer(block_size=block_size)
-        self.scheduler = KvScheduler(
-            config=SchedulerConfig(overlap_weight=2.0, max_requests_per_worker=16),
-            indexer=self.indexer,
-            block_size=block_size,
+        self.kv_index = KvIndex()
+        self.tokenizer = _get_tokenizer(model)
+
+        # Phase 3: KV Block Migration manager
+        self.migration = MigrationManager(
+            prefill_instances=prefill_instances,
+            decode_instances=decode_instances,
+            decode_cache_capacity=decode_cache_capacity,
+            migration_threshold=migration_threshold,
         )
-        worker_ids = [WorkerId(i) for i in range(len(prefill_urls))]
-        self.block_pools = {i: BlockPool(total_blocks=max_kv_blocks, block_size=block_size) for i in range(len(prefill_urls))}
-        self.disagg_router = DisaggregatedRouter(
-            worker_ids=worker_ids,
-            block_pools={wid: self.block_pools[wid.value] for wid in worker_ids},
-            block_size=block_size,
-            max_local_prefill_length=max_local_prefill_length,
+
+        # Phase 4: Preemption manager
+        self.preemptor = PreemptionManager(self.migration)
+
+        # Phase 5: Dynamic pool scaling
+        self.scaler = ScalingManager()
+
+        # Track conversation_id -> (p_idx, d_idx) for multi-turn cache locality
+        self._conv_worker: Dict[str, tuple] = {}
+
+        log.info(
+            "DisaggProxy mode=%s model=%s P=%d D=%d policy=%s",
+            mode, model, len(prefill_instances), len(decode_instances),
+            type(policy).__name__,
         )
 
-        self.tokenizer = _get_tokenizer(model_name)
-
-        self._req_counter = 0
-        self._req_worker: Dict[str, int] = {}
-        self._req_block_hashes: Dict[str, List[LocalBlockHash]] = {}
-        self._req_decode: Dict[str, Optional[int]] = {}
-
-        log.info("Gateway: %d prefill + %d decode workers, block_size=%d, kv_events=%s",
-                 len(prefill_urls), len(decode_urls), block_size, bool(self.kv_events_ports))
-
-    def _get_worker_loads(self) -> Dict[WorkerId, WorkerLoad]:
-        return {WorkerId(wid): ws.to_worker_load(wid) for wid, ws in self.prefill_states.items()}
-
-    def _get_decode_loads(self) -> Dict[int, float]:
-        if not self.decode_states:
-            return {}
-        max_active = max((s.active_requests for s in self.decode_states.values()), default=1)
-        return {did: s.active_requests / max(max_active, 1) for did, s in self.decode_states.items()}
-
-    def _route(self, body: dict) -> tuple[str, str]:
-        """Route request → (prefill_url, request_id).
-
-        Selects prefill worker via cost function (overlap + cache + decode load),
-        then optionally offloads via disaggregated router.
-        Update the radix tree optimistically at routing time.
-        """
+    def _tokenize(self, body: dict) -> List[int]:
         messages = body.get("messages", [])
         prompt = body.get("prompt", "")
-        text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) if messages else prompt
-        token_ids = self.tokenizer.encode(text) if text else []
-
-        # 1. Cost function selection (prefill load + decode load)
-        loads = self._get_worker_loads()
-        decode_loads = self._get_decode_loads()
-        worker_id = self.scheduler.select_worker(token_ids, loads, decode_loads=decode_loads)
-        if worker_id is None:
-            worker_id = WorkerId(self._req_counter % len(self.prefill_urls))
-        wid = worker_id.value
-
-        # 2. Disaggregation decision
-        worker_loads = {WorkerId(k): v.active_requests for k, v in self.prefill_states.items()}
-        decision = self.disagg_router.should_prefill_remote(
-            token_ids, WorkerId(wid), worker_loads,
-        )
-        if decision.should_prefill_remote and decision.remote_worker_id is not None:
-            wid = decision.remote_worker_id.value
-
-        # 3. Pick decode worker (paired by index)
-        decode_id = wid % len(self.decode_states) if self.decode_states else None
-
-        self._req_counter += 1
-        req_id = f"req-{self._req_counter}"
-        self._req_worker[req_id] = wid
-        self._req_decode[req_id] = decode_id
-
-        # 4. Eagerly update the radix tree — blocks are being computed NOW on wid
-        block_hashes = compute_block_hash_for_seq(token_ids, self.block_size)
-        if block_hashes:
-            blocks = [
-                KvCacheStoredBlockData(tokens_hash=bh, block_hash=ExternalSequenceBlockHash(bh.value))
-                for bh in block_hashes
-            ]
-            event = RouterEvent(
-                worker_id=wid,
-                event=KvCacheEvent(
-                    event_id=self._req_counter,
-                    data=KvCacheEventData.stored(parent_hash=None, blocks=blocks),
-                ),
-            )
-            self.indexer.apply_event(event)
-            self._req_block_hashes[req_id] = block_hashes
-
-        overlap = self.indexer.find_matches_for_request(token_ids)
-        decode_usage = decode_loads.get(wid, 0.0) if decode_id is not None else 0.0
-        log.info("Route → prefill_%d decode_%s (isl=%d, overlap=%d, decode_usage=%.2f, remote=%s)",
-                 wid, decode_id, len(token_ids), overlap.scores.get(wid, 0),
-                 decode_usage, decision.should_prefill_remote)
-
-        return self.prefill_urls[wid], req_id
-
-    def _complete(self, request_id: str):
-        """Commit blocks to BlockPool on request completion (evicts if full)."""
-        wid = self._req_worker.pop(request_id, None)
-        if wid is None:
-            return
-
-        block_hashes = self._req_block_hashes.pop(request_id, None)
-        if not block_hashes:
-            return
-
-        pool = self.block_pools[wid]
-        block_ids = pool.allocate(len(block_hashes))
-        for bid, bh in zip(block_ids, block_hashes):
-            pool.commit(bid, bh)
-
-    async def _kv_events_listener(self, worker_id: int, port: int):
-        """Subscribe to vLLM KV events via ZMQ and update the radix tree in real-time."""
-        ctx = zmq.asyncio.Context()
-        socket = ctx.socket(zmq.SUB)
-        socket.connect(f"tcp://127.0.0.1:{port}")
-        socket.subscribe("kv-events")
-        log.info("ZMQ subscriber for worker_%d connected to port %d", worker_id, port)
-        while True:
-            try:
-                _, payload = await socket.recv_multipart()
-                msg: dict[str, Any] = json.loads(payload)
-                event_id = msg.get("event_id", 0)
-                etype = msg.get("type", "")
-                blocks_raw = msg.get("blocks", [])
-
-                if etype == "stored":
-                    blocks = [
-                        KvCacheStoredBlockData(
-                            tokens_hash=LocalBlockHash(b["token_hash"]),
-                            block_hash=ExternalSequenceBlockHash(b["block_hash"]),
-                        )
-                        for b in blocks_raw if "token_hash" in b and "block_hash" in b
-                    ]
-                    if not blocks:
-                        continue
-                    parent_hash_raw = msg.get("parent_hash")
-                    parent_hash = ExternalSequenceBlockHash(parent_hash_raw) if parent_hash_raw is not None else None
-                    event = RouterEvent(
-                        worker_id=worker_id,
-                        event=KvCacheEvent(
-                            event_id=event_id,
-                            data=KvCacheEventData.stored(parent_hash=parent_hash, blocks=blocks),
-                        ),
-                    )
-                    self.indexer.apply_event(event)
-                    log.debug("ZMQ stored: worker_%d %d blocks (event=%d)", worker_id, len(blocks), event_id)
-
-                elif etype == "removed":
-                    block_hashes = [
-                        ExternalSequenceBlockHash(b["block_hash"])
-                        for b in blocks_raw if "block_hash" in b
-                    ]
-                    if not block_hashes:
-                        continue
-                    event = RouterEvent(
-                        worker_id=worker_id,
-                        event=KvCacheEvent(
-                            event_id=event_id,
-                            data=KvCacheEventData.removed(block_hashes=block_hashes),
-                        ),
-                    )
-                    self.indexer.apply_event(event)
-                    log.debug("ZMQ removed: worker_%d %d blocks (event=%d)", worker_id, len(block_hashes), event_id)
-
-            except Exception:
-                log.exception("ZMQ subscriber error for worker_%d", worker_id)
-                await asyncio.sleep(1)
-
-    async def _update_loads(self):
-        while True:
-            all_states = list(self.prefill_states.values()) + list(self.decode_states.values())
-            await asyncio.gather(*(ws.scrape_metrics() for ws in all_states))
-            self.scheduler.update_worker_loads(self._get_worker_loads())
-            await asyncio.sleep(2)
-
-
-# ── FastAPI app ───────────────────────────────────────────────────────
-
-def _make_proxy_handler(endpoint: str):
-    """Create a streaming + non-streaming proxy handler for an endpoint."""
-    async def handler(request: Request):
-        body = await request.json()
-        is_stream = body.get("stream", False)
-        gw: KvRouterGateway = request.app.state.gateway
-
-        prefill_url, req_id = gw._route(body)
-        target = f"{prefill_url}{endpoint}"
-
-        if is_stream:
-            async def stream():
-                try:
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
-                        async with client.stream("POST", target, json=body, headers={"Content-Type": "application/json"}) as resp:
-                            if resp.status_code != 200:
-                                err = b""
-                                async for chunk in resp.aiter_bytes():
-                                    err += chunk
-                                log.error("Upstream %d: %s", resp.status_code, err[:200])
-                                yield f"data: {err.decode()}\n\n"
-                                return
-                            async for chunk in resp.aiter_bytes():
-                                yield chunk
-                finally:
-                    gw._complete(req_id)
-            return StreamingResponse(stream(), media_type="text/event-stream")
+        if messages:
+            text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         else:
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                resp = await client.post(target, json=body, headers={"Content-Type": "application/json"})
-            gw._complete(req_id)
-            if resp.status_code != 200:
-                log.error("Upstream %d: %s", resp.status_code, resp.text[:200])
-                return JSONResponse(status_code=resp.status_code, content={"error": resp.text[:200]})
-            return JSONResponse(content=resp.json())
+            text = prompt
+        return self.tokenizer.encode(text) if text else []
 
-    return handler
+    def _pick(self, body: dict) -> tuple[str, str, int, str, int, int]:
+        token_ids = self._tokenize(body)
+        conv_id = body.get("conversation_id")
+
+        # Phase 4: Promotion — check if this was a preempted session
+        if conv_id:
+            promoted = self.preemptor.promote(conv_id)
+            if promoted is not None:
+                d_overlap = self.migration.registry.overlap_decode(
+                    promoted.original_d_idx, promoted.block_hashes,
+                )
+                if d_overlap > 0 and not self.scaler.is_draining_decode(promoted.original_d_idx):
+                    log.info("PROMOTE[%s] original D%d overlap=%d",
+                             conv_id[:8], promoted.original_d_idx, d_overlap)
+                    d_idx = promoted.original_d_idx
+                    p_idx = promoted.original_p_idx
+                    self._conv_worker[conv_id] = (p_idx, d_idx)
+                    p_url = self.prefill_instances[p_idx]
+                    d_url = self.decode_instances[d_idx]
+                    eid = self.p_engine_ids[p_idx]
+                    sport = self.p_side_ports[p_idx]
+                    return p_url, d_url, p_idx, eid, sport, d_idx
+                log.info("PROMOTE[%s] blocks evicted or draining, re-routing", conv_id[:8])
+            else:
+                self.preemptor.access(conv_id)
+
+        # Phase 2+3+5: Standard routing — skip draining workers
+        p_valid = [i for i in range(len(self.prefill_instances))
+                   if not self.scaler.is_draining_prefill(i)]
+        d_valid = [i for i in range(len(self.decode_instances))
+                   if not self.scaler.is_draining_decode(i)]
+
+        if conv_id and conv_id in self._conv_worker:
+            p_idx, d_idx = self._conv_worker[conv_id]
+            if (p_idx in p_valid and d_idx in d_valid):
+                log.debug("CONV_CACHE[%s] reuse P%d D%d", conv_id[:8], p_idx, d_idx)
+                p_url = self.prefill_instances[p_idx]
+                d_url = self.decode_instances[d_idx]
+                eid = self.p_engine_ids[p_idx]
+                sport = self.p_side_ports[p_idx]
+                return p_url, d_url, p_idx, eid, sport, d_idx
+
+        if not p_valid:
+            p_valid = list(range(len(self.prefill_instances)))
+        if not d_valid:
+            d_valid = list(range(len(self.decode_instances)))
+
+        # Phase 2: overlap-based prefill selection among valid workers
+        all_scores = self.kv_index.compute_overlap(token_ids, self.block_size).scores
+        p_scores = {i: all_scores.get(i, 0) for i in p_valid}
+        ctx = ScheduleContext(token_ids=token_ids,
+                              overlap=OverlapResult(scores=p_scores),
+                              worker_loads={})
+        idx = self.policy.select(len(self.prefill_instances), ctx)
+        if idx not in p_valid:
+            idx = p_valid[0]
+
+        # Phase 3+5: KVBM decode selection among valid workers
+        block_hashes = set(token_ids_to_block_hashes(token_ids, self.block_size))
+        d_idx, d_overlap = self.migration.best_decode(block_hashes, valid_only=d_valid)
+
+        p_url = self.prefill_instances[idx]
+        d_url = self.decode_instances[d_idx]
+        eid = self.p_engine_ids[idx]
+        sport = self.p_side_ports[idx]
+
+        log.info("KVBM route P%d D%d overlap=%d", idx, d_idx, d_overlap)
+
+        if conv_id:
+            self._conv_worker[conv_id] = (idx, d_idx)
+
+        return p_url, d_url, idx, eid, sport, d_idx
+
+    def _record_blocks(self, p_idx: int, d_idx: int, token_ids: List[int], conv_id: Optional[str] = None):
+        hashes = token_ids_to_block_hashes(token_ids, self.block_size)
+        if hashes:
+            self.kv_index.record_blocks(p_idx, hashes)
+            self.migration.record_prefill_blocks(p_idx, hashes)
+            self.migration.record_decode_blocks(d_idx, hashes)
+            if conv_id:
+                self.preemptor.register(conv_id, token_ids, hashes, p_idx, d_idx)
+
+    async def _forward_stream(self, url: str, body: dict, headers: dict) -> AsyncGenerator[bytes, None]:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as c:
+            async with c.stream("POST", url, json=body, headers=headers) as resp:
+                if resp.status_code != 200:
+                    err = await resp.aread()
+                    raise RuntimeError(
+                        f"Upstream {url} returned {resp.status_code}: {err[:200].decode(errors='replace')}"
+                    )
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+
+    async def _forward_once(self, url: str, body: dict, headers: dict) -> httpx.Response:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as c:
+            return await c.post(url, json=body, headers=headers)
+
+    async def _drain(self, url: str, body: dict, headers: dict):
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as c:
+            async with c.stream("POST", url, json=body, headers=headers) as resp:
+                async for _ in resp.aiter_bytes():
+                    pass
+
+    async def _push(self, raw_request: Request):
+        body = await raw_request.json()
+        req_id = str(uuid.uuid4())
+        p_url, d_url, idx, eid, sport, d_idx = self._pick(body)
+        headers = {"X-Request-Id": req_id}
+
+        p_body = body.copy()
+        p_body["max_tokens"] = 1
+        p_body["kv_transfer_params"] = {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "remote_engine_id": None,
+            "remote_block_ids": None,
+            "remote_host": None,
+            "remote_port": None,
+        }
+
+        d_body = body.copy()
+        d_body["kv_transfer_params"] = {
+            "do_remote_decode": False,
+            "do_remote_prefill": True,
+            "remote_engine_id": eid,
+            "remote_host": self.p_kv_host,
+            "remote_port": sport,
+            "tp_size": self.p_tp_size,
+            "pp_size": self.p_pp_size,
+            "remote_request_id": req_id,
+        }
+
+        log.info("PUSH[%s] P=%s D=%s engine=%s", req_id[:8], p_url, d_url, eid)
+
+        token_ids = self._tokenize(body)
+        p_task = asyncio.create_task(
+            self._drain(f"http://{p_url}/v1/chat/completions", p_body, headers)
+        )
+
+        try:
+            d_stream = self._forward_stream(f"http://{d_url}/v1/chat/completions", d_body, headers)
+        except RuntimeError as e:
+            p_task.cancel()
+            log.error("Decode-side failure for PUSH[%s]: %s", req_id[:8], e)
+            return JSONResponse(status_code=502, content={"error": str(e)})
+
+        await p_task
+        self._record_blocks(idx, d_idx, token_ids, body.get("conversation_id"))
+
+        return StreamingResponse(d_stream, media_type="text/event-stream")
+
+    async def _pull(self, raw_request: Request):
+        body = await raw_request.json()
+        req_id = str(uuid.uuid4())
+        p_url, d_url, idx, eid, sport, d_idx = self._pick(body)
+        headers = {"X-Request-Id": req_id}
+
+        p_body = body.copy()
+        p_body["max_tokens"] = 1
+        p_body["kv_transfer_params"] = {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "remote_engine_id": None,
+            "remote_block_ids": None,
+            "remote_host": None,
+            "remote_port": None,
+        }
+
+        log.info("PULL[%s] P=%s D=%s", req_id[:8], p_url, d_url)
+
+        resp = await self._forward_once(f"http://{p_url}/v1/chat/completions", p_body, headers)
+        if resp.status_code != 200:
+            return JSONResponse(status_code=resp.status_code, content={"error": resp.text[:200]})
+        result = resp.json()
+
+        token_ids = self._tokenize(body)
+        self._record_blocks(idx, d_idx, token_ids, body.get("conversation_id"))
+
+        kv_params = result.get("kv_transfer_params") or {}
+        d_body = body.copy()
+        d_body["kv_transfer_params"] = {
+            "do_remote_decode": False,
+            "do_remote_prefill": True,
+            "remote_engine_id": kv_params.get("remote_engine_id") or eid,
+            "remote_host": kv_params.get("remote_host") or self.p_kv_host,
+            "remote_port": kv_params.get("remote_port") or sport,
+            "remote_block_ids": kv_params.get("remote_block_ids"),
+            "tp_size": kv_params.get("tp_size", self.p_tp_size),
+            "pp_size": kv_params.get("pp_size", self.p_pp_size),
+            "remote_request_id": req_id,
+        }
+        d_body.setdefault("max_tokens", body.get("max_tokens", 1024))
+
+        try:
+            d_stream = self._forward_stream(f"http://{d_url}/v1/chat/completions", d_body, headers)
+        except RuntimeError as e:
+            log.error("Decode-side failure for PULL[%s]: %s", req_id[:8], e)
+            return JSONResponse(status_code=502, content={"error": str(e)})
+
+        return StreamingResponse(d_stream, media_type="text/event-stream")
 
 
-def create_app(prefill_ports: List[int], decode_ports: List[int], kv_events_ports: Optional[List[int]] = None, **kwargs) -> FastAPI:
-    app = FastAPI(title="Nano-Dynamo KV Router")
-    prefill_urls = [f"http://127.0.0.1:{p}" for p in prefill_ports]
-    decode_urls = [f"http://127.0.0.1:{p}" for p in decode_ports]
+# ── FastAPI app ────────────────────────────────────────────────────
 
-    app.state.gateway = KvRouterGateway(prefill_urls, decode_urls, kv_events_ports=kv_events_ports, **kwargs)
+def create_app(**kwargs) -> FastAPI:
+    app = FastAPI(title="Nano-Dynamo")
+    proxy = DisaggProxy(**kwargs)
+    app.state.proxy = proxy
 
-    @app.on_event("startup")
-    async def startup():
-        gw = app.state.gateway
-        asyncio.create_task(gw._update_loads())
-        for i, port in enumerate(gw.kv_events_ports):
-            asyncio.create_task(gw._kv_events_listener(i, port))
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
 
     @app.get("/v1/models")
     async def list_models():
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{prefill_urls[0]}/v1/models")
-            return JSONResponse(content=resp.json())
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"http://{proxy.prefill_instances[0]}/v1/models")
+            return JSONResponse(content=r.json())
 
-    app.post("/v1/chat/completions")(_make_proxy_handler("/v1/chat/completions"))
-    app.post("/v1/completions")(_make_proxy_handler("/v1/completions"))
-    app.get("/health")(lambda: {"status": "ok"})
+    @app.post("/v1/chat/completions")
+    async def chat_completions(raw_request: Request):
+        if proxy.mode == "pull":
+            return await proxy._pull(raw_request)
+        return await proxy._push(raw_request)
+
+    @app.post("/v1/completions")
+    async def completions(raw_request: Request):
+        if proxy.mode == "pull":
+            return await proxy._pull(raw_request)
+        return await proxy._push(raw_request)
+
+    @app.get("/status")
+    async def status():
+        return {
+            "mode": proxy.mode,
+            "model": proxy.model,
+            "prefill_instances": proxy.prefill_instances,
+            "decode_instances": proxy.decode_instances,
+            "policy": type(proxy.policy).__name__,
+        }
+
+    @app.get("/kvbm/status")
+    async def kvbm_status():
+        overloaded = proxy.migration.overloaded_workers()
+        return {
+            "decode_loads": {
+                f"D{i}": round(proxy.migration.decode_load(i), 3)
+                for i in range(len(proxy.decode_instances))
+            },
+            "overloaded": overloaded,
+            "decode_usage": {
+                f"D{i}": proxy.migration._decode_usage.get(i, 0)
+                for i in range(len(proxy.decode_instances))
+            },
+        }
+
+    @app.post("/kvbm/preempt")
+    async def kvbm_preempt(raw_request: Request):
+        body = await raw_request.json()
+        d_idx = body.get("d_idx")
+        count = body.get("count", proxy.preempt_batch)
+        if d_idx is not None:
+            evicted = proxy.preemptor.preempt(d_idx, count)
+            return {"preempted": len(evicted), "sessions": [e.conv_id for e in evicted]}
+        results = {}
+        for didx in proxy.migration.overloaded_workers():
+            evicted = proxy.preemptor.preempt(didx, count)
+            results[f"D{didx}"] = len(evicted)
+        return {"preempted": results}
+
+    @app.get("/kvbm/preempted")
+    async def kvbm_preempted():
+        return {
+            "count": proxy.preemptor.preempted_count(),
+            "sessions": proxy.preemptor.preempted_list(),
+        }
+
+    @app.post("/scale/drain")
+    async def scale_drain(raw_request: Request):
+        body = await raw_request.json()
+        role = body.get("role", "decode")
+        idx = body.get("idx")
+        if role == "prefill":
+            result = proxy.scaler.drain_prefill(idx)
+        else:
+            result = proxy.scaler.drain_decode(idx)
+        return result
+
+    @app.post("/scale/activate")
+    async def scale_activate(raw_request: Request):
+        body = await raw_request.json()
+        role = body.get("role", "decode")
+        idx = body.get("idx")
+        if role == "prefill":
+            result = proxy.scaler.activate_prefill(idx)
+        else:
+            result = proxy.scaler.activate_decode(idx)
+        return result
+
+    @app.get("/scale/status")
+    async def scale_status():
+        return proxy.scaler.pool_metrics(proxy)
+
+    @app.get("/scale/events")
+    async def scale_events():
+        return {"events": proxy.scaler.events()}
+
+    # Phase 4+5 background tasks
+    @app.on_event("startup")
+    async def start_background_tasks():
+        async def _preempt_loop():
+            while True:
+                await asyncio.sleep(5)
+                for didx in proxy.migration.overloaded_workers():
+                    load = proxy.migration.decode_load(didx)
+                    if load >= proxy.preempt_threshold:
+                        count = max(1, int((load - proxy.preempt_threshold) * 10))
+                        evicted = proxy.preemptor.preempt(didx, count)
+                        if evicted:
+                            log.warning("PROACTIVE PREEMPT D%d load=%.2f evicted=%d",
+                                        didx, load, len(evicted))
+        async def _auto_scale_loop():
+            while True:
+                await asyncio.sleep(15)
+                rec = proxy.scaler.auto_scale(proxy)
+                if rec:
+                    log.info("AUTOSCALE recommend: %s", rec)
+        asyncio.create_task(_preempt_loop())
+        asyncio.create_task(_auto_scale_loop())
 
     return app
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Nano-Dynamo KV Router")
+    parser = argparse.ArgumentParser(description="Nano-Dynamo Disaggregated Proxy")
+    parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--prefill-ports", type=int, nargs="+", default=[8100])
     parser.add_argument("--decode-ports", type=int, nargs="+", default=[8200])
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-3B-Instruct")
-    parser.add_argument("--max-local-prefill", type=int, default=512)
-    parser.add_argument("--kv-events-ports", type=int, nargs="*", default=None,
-                        help="ZMQ ports for vLLM KV events (one per prefill worker)")
+    parser.add_argument("--mode", type=str, default="push", choices=["push", "pull"])
+    parser.add_argument("--prefill-kv-host", type=str, default="127.0.0.1")
+    parser.add_argument("--prefill-side-channel-ports", type=int, nargs="*", default=None)
+    parser.add_argument("--prefill-tp-size", type=int, default=1)
+    parser.add_argument("--prefill-pp-size", type=int, default=1)
+    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--decode-cache-capacity", type=int, default=4096)
+    parser.add_argument("--migration-threshold", type=float, default=0.80)
+    parser.add_argument("--preempt-threshold", type=float, default=0.85)
+    parser.add_argument("--preempt-batch", type=int, default=1)
     args = parser.parse_args()
 
+    prefill_hosts = [f"127.0.0.1:{p}" for p in args.prefill_ports]
+    decode_hosts = [f"127.0.0.1:{p}" for p in args.decode_ports]
+
     uvicorn.run(
-        create_app(args.prefill_ports, args.decode_ports, kv_events_ports=args.kv_events_ports,
-                   model_name=args.model, max_local_prefill_length=args.max_local_prefill),
-        host=args.host, port=args.port,
+        create_app(
+            prefill_instances=prefill_hosts,
+            decode_instances=decode_hosts,
+            model=args.model,
+            mode=args.mode,
+            prefill_kv_host=args.prefill_kv_host,
+            prefill_side_channel_ports=args.prefill_side_channel_ports,
+            prefill_tp_size=args.prefill_tp_size,
+            prefill_pp_size=args.prefill_pp_size,
+            block_size=args.block_size,
+            decode_cache_capacity=args.decode_cache_capacity,
+            migration_threshold=args.migration_threshold,
+            preempt_threshold=args.preempt_threshold,
+            preempt_batch=args.preempt_batch,
+        ),
+        host=args.host,
+        port=args.port,
     )
