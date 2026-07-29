@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 nano-dynamo contributors
+# SPDX-FileCopyrightText: Copyright (c) 2025 kv-prefix-router contributors
 # SPDX-License-Identifier: MIT
 
 from __future__ import annotations
@@ -22,18 +22,6 @@ class KvBlock:
     block_id: BlockId
     state: KvBlockState
     block_hash: Optional[LocalBlockHash] = None
-
-
-@dataclass
-class AvailableBlocks:
-    count: int = 0
-    max_count: int = 0
-
-
-@dataclass
-class InflightBlocks:
-    count: int = 0
-    max_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -63,15 +51,6 @@ class BlockPool:
         self._committed_index: Dict[LocalBlockHash, BlockId] = {}
         self._eviction_queue: deque[LocalBlockHash] = deque()
 
-    @property
-    def available(self) -> AvailableBlocks:
-        return AvailableBlocks(count=len(self._free), max_count=self.total_blocks)
-
-    @property
-    def inflight(self) -> InflightBlocks:
-        count = sum(1 for b in self.blocks if b is not None and b.state == KvBlockState.INFLIGHT)
-        return InflightBlocks(count=count, max_count=self.total_blocks)
-
     def _evict_until_free(self, needed: int) -> None:
         while len(self._free) < needed and self._eviction_queue:
             h = self._eviction_queue.popleft()
@@ -96,7 +75,7 @@ class BlockPool:
         if len(self._free) < count:
             raise RuntimeError(
                 f"BlockPool: asked for {count} blocks, only {len(self._free)} free "
-                f"(pool size {self.total_blocks}, inflight {self.inflight.count})"
+                f"(pool size {self.total_blocks})"
             )
 
         allocated: List[BlockId] = []
@@ -165,25 +144,10 @@ class BlockPool:
             inflight_count=inflight,
         )
 
-    def evict(self, block_hashes: List[LocalBlockHash]) -> List[BlockId]:
-        evicted: List[BlockId] = []
-        for h in block_hashes:
-            bid = self._committed_index.pop(h, None)
-            if bid is None:
-                continue
-            idx = bid.value
-            block = self.blocks[idx]
-            if block is not None and block.state == KvBlockState.COMMITTED:
-                block.state = KvBlockState.FREE
-                block.block_hash = None
-                self._free.append(idx)
-                evicted.append(bid)
-        return evicted
-
     def __repr__(self) -> str:
         free = len(self._free)
         committed = len(self._committed_index)
-        inflight = self.inflight.count
+        inflight = sum(1 for b in self.blocks if b is not None and b.state == KvBlockState.INFLIGHT)
         return (
             f"BlockPool(total={self.total_blocks}, "
             f"free={free}, committed={committed}, inflight={inflight})"

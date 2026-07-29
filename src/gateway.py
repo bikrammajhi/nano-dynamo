@@ -105,7 +105,7 @@ class KvRouterGateway:
         # Dynamo components
         self.indexer = KvIndexer(block_size=block_size)
         self.scheduler = KvScheduler(
-            config=SchedulerConfig(overlap_score_credit=1.0, router_temperature=0.0, max_requests_per_worker=16),
+            config=SchedulerConfig(overlap_weight=2.0, max_requests_per_worker=16),
             indexer=self.indexer,
             block_size=block_size,
         )
