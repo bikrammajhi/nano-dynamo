@@ -123,26 +123,35 @@ class KvRouterGateway:
         self._req_counter = 0
         self._req_worker: Dict[str, int] = {}
         self._req_block_hashes: Dict[str, List[LocalBlockHash]] = {}
+        self._req_decode: Dict[str, Optional[int]] = {}
 
         log.info("Gateway: %d prefill + %d decode workers, block_size=%d", len(prefill_urls), len(decode_urls), block_size)
 
     def _get_worker_loads(self) -> Dict[WorkerId, WorkerLoad]:
         return {WorkerId(wid): ws.to_worker_load(wid) for wid, ws in self.prefill_states.items()}
 
+    def _get_decode_loads(self) -> Dict[int, float]:
+        if not self.decode_states:
+            return {}
+        max_active = max((s.active_requests for s in self.decode_states.values()), default=1)
+        return {did: s.active_requests / max(max_active, 1) for did, s in self.decode_states.items()}
+
     def _route(self, body: dict) -> tuple[str, str]:
         """Route request → (prefill_url, request_id).
 
-        Update the radix tree optimistically at routing time, not at request
-        completion — so the next request sees blocks being computed right now.
+        Selects prefill worker via cost function (overlap + cache + decode load),
+        then optionally offloads via disaggregated router.
+        Update the radix tree optimistically at routing time.
         """
         messages = body.get("messages", [])
         prompt = body.get("prompt", "")
         text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) if messages else prompt
         token_ids = self.tokenizer.encode(text) if text else []
 
-        # 1. Cost function selection
+        # 1. Cost function selection (prefill load + decode load)
         loads = self._get_worker_loads()
-        worker_id = self.scheduler.select_worker(token_ids, loads)
+        decode_loads = self._get_decode_loads()
+        worker_id = self.scheduler.select_worker(token_ids, loads, decode_loads=decode_loads)
         if worker_id is None:
             worker_id = WorkerId(self._req_counter % len(self.prefill_urls))
         wid = worker_id.value
@@ -155,11 +164,15 @@ class KvRouterGateway:
         if decision.should_prefill_remote and decision.remote_worker_id is not None:
             wid = decision.remote_worker_id.value
 
+        # 3. Pick decode worker (paired by index)
+        decode_id = wid % len(self.decode_states) if self.decode_states else None
+
         self._req_counter += 1
         req_id = f"req-{self._req_counter}"
         self._req_worker[req_id] = wid
+        self._req_decode[req_id] = decode_id
 
-        # 3. Eagerly update the radix tree — blocks are being computed NOW on wid
+        # 4. Eagerly update the radix tree — blocks are being computed NOW on wid
         block_hashes = compute_block_hash_for_seq(token_ids, self.block_size)
         if block_hashes:
             blocks = [
@@ -177,8 +190,10 @@ class KvRouterGateway:
             self._req_block_hashes[req_id] = block_hashes
 
         overlap = self.indexer.find_matches_for_request(token_ids)
-        log.info("Route → prefill_%d (isl=%d, overlap=%d, remote=%s)",
-                 wid, len(token_ids), overlap.scores.get(wid, 0), decision.should_prefill_remote)
+        decode_usage = decode_loads.get(wid, 0.0) if decode_id is not None else 0.0
+        log.info("Route → prefill_%d decode_%s (isl=%d, overlap=%d, decode_usage=%.2f, remote=%s)",
+                 wid, decode_id, len(token_ids), overlap.scores.get(wid, 0),
+                 decode_usage, decision.should_prefill_remote)
 
         return self.prefill_urls[wid], req_id
 
@@ -199,7 +214,8 @@ class KvRouterGateway:
 
     async def _update_loads(self):
         while True:
-            await asyncio.gather(*(ws.scrape_metrics() for ws in self.prefill_states.values()))
+            all_states = list(self.prefill_states.values()) + list(self.decode_states.values())
+            await asyncio.gather(*(ws.scrape_metrics() for ws in all_states))
             self.scheduler.update_worker_loads(self._get_worker_loads())
             await asyncio.sleep(2)
 

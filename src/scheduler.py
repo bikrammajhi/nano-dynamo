@@ -11,6 +11,7 @@ from .radix_tree import KvIndexer, OverlapScores
 @dataclass(frozen=True)
 class SchedulerConfig:
     overlap_weight: float = 2.0
+    decode_usage_weight: float = 1.0
     max_requests_per_worker: int = 16
 
 
@@ -53,7 +54,8 @@ class KvScheduler:
 
     def _compute_worker_logit(
         self, isl_blocks: float, worker_load: WorkerLoad,
-        overlap_signals: OverlapSignals, max_waiting: int
+        overlap_signals: OverlapSignals, max_waiting: int,
+        decode_usage: float = 0.0,
     ) -> float:
         wid = worker_load.worker_id.value
         matching_blocks = overlap_signals.overlap_blocks.get(wid, 0)
@@ -70,10 +72,11 @@ class KvScheduler:
             if max_waiting > 0 else 0.0
         )
 
-        return self.config.overlap_weight * score - cache_usage - waiting
+        return self.config.overlap_weight * score - cache_usage - waiting - self.config.decode_usage_weight * decode_usage
 
     def select_worker(
-        self, token_ids: List[int], worker_loads: Dict[WorkerId, WorkerLoad]
+        self, token_ids: List[int], worker_loads: Dict[WorkerId, WorkerLoad],
+        decode_loads: Optional[Dict[int, float]] = None,
     ) -> Optional[WorkerId]:
         if not worker_loads:
             raise ValueError("worker_loads must not be empty")
@@ -110,7 +113,10 @@ class KvScheduler:
         max_waiting = max(load.active_requests for _, load in candidates)
 
         worker_logits = {
-            wid.value: self._compute_worker_logit(isl_blocks, load, overlap_signals, max_waiting)
+            wid.value: self._compute_worker_logit(
+                isl_blocks, load, overlap_signals, max_waiting,
+                decode_usage=(decode_loads or {}).get(wid.value, 0.0),
+            )
             for wid, load in candidates
         }
 
