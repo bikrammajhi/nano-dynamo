@@ -263,8 +263,41 @@ async def smoke_test(mode: str = _TRANSFER_MODE):
         except FileNotFoundError:
             log.warning("  Proxy log not found at %s", lp)
 
-        # ── Test 7: KVBM decode load tracking ────────────────────────
-        log.info("TEST 7: KVBM decode load tracking")
+# ── Test 6b: Overlap-based prefill routing feedback loop ──
+        log.info("TEST 6b: Overlap-based prefill routing (cache hit bias)")
+        p0_before = p0_routes
+        p1_before = p1_routes
+        async with httpx.AsyncClient(timeout=120) as client:
+            for i in range(20):
+                resp = await client.post(f"{url}/v1/chat/completions", json={
+                    "model": _MODEL,
+                    "messages": [
+                        {"role": "user", "content": f"What is {i+2}*{i+3}?"},
+                    ],
+                    "max_tokens": 10, "temperature": 0,
+                })
+                assert resp.status_code == 200, f"Overlap req {i}: {resp.status_code}"
+        p0_after = 0
+        p1_after = 0
+        try:
+            with open(lp) as f:
+                for line in f:
+                    if "PUSH[" in line:
+                        if ":8100" in line:
+                            p0_after += 1
+                        elif ":8101" in line:
+                            p1_after += 1
+        except FileNotFoundError:
+            pass
+        p0_new = p0_after - p0_before
+        p1_new = p1_after - p1_before
+        log.info("  Overlap requests: P0=%d P1=%d", p0_new, p1_new)
+        log.info("  ✓ Overlap routing bias confirmed: P0 received %d of 20 same-prefix requests", p0_new)
+        assert p0_new >= 18, f"Expected P0 to get >=18 of 20 overlap requests, got {p0_new}"
+        log.info("  PASS")
+
+        # ── Test 8: KVBM decode load tracking ────────────────────────
+        log.info("TEST 8: KVBM decode load tracking")
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(f"{url}/kvbm/status")
             assert resp.status_code == 200, f"KVBM status: {resp.status_code}"
@@ -276,8 +309,8 @@ async def smoke_test(mode: str = _TRANSFER_MODE):
             log.info("  Overloaded: %s", data.get("overloaded", []))
             log.info("  PASS")
 
-        # ── Test 8: KVBM route distribution ──────────────────────────
-        log.info("TEST 8: KVBM route distribution")
+        # ── Test 9: KVBM route distribution ──────────────────────────
+        log.info("TEST 9: KVBM route distribution")
         kvbm_route_lines = 0
         d0_count = 0
         d1_count = 0
@@ -297,8 +330,8 @@ async def smoke_test(mode: str = _TRANSFER_MODE):
         except FileNotFoundError:
             log.warning("  Proxy log not found at %s", lp)
 
-        # ── Test 9: Preemption API ─────────────────────────────────────
-        log.info("TEST 9: Preemption API")
+        # ── Test 10: Preemption API ─────────────────────────────────────
+        log.info("TEST 10: Preemption API")
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(f"{url}/kvbm/preempt", json={"d_idx": 0, "count": 1})
             assert resp.status_code == 200, f"Preempt: {resp.status_code}"
@@ -310,8 +343,8 @@ async def smoke_test(mode: str = _TRANSFER_MODE):
             log.info("  Preempted sessions: count=%d", data2.get("count", 0))
             log.info("  PASS")
 
-        # ── Test 10: Promotion via conversation_id ─────────────────────
-        log.info("TEST 10: Session promotion")
+        # ── Test 11: Promotion via conversation_id ─────────────────────
+        log.info("TEST 11: Session promotion")
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(f"{url}/v1/chat/completions", json={
                 "model": _MODEL,
@@ -326,8 +359,8 @@ async def smoke_test(mode: str = _TRANSFER_MODE):
             log.info("  Promotion response: %s", content.strip()[:40])
             log.info("  PASS")
 
-        # ── Test 11: Scaling drain/activate API ────────────────────────
-        log.info("TEST 11: Scaling drain/activate API")
+        # ── Test 12: Scaling drain/activate API ────────────────────────
+        log.info("TEST 12: Scaling drain/activate API")
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(f"{url}/scale/drain", json={"role": "decode", "idx": 0})
             assert resp.status_code == 200, f"Drain: {resp.status_code}"
@@ -343,8 +376,8 @@ async def smoke_test(mode: str = _TRANSFER_MODE):
             log.info("  Activated D0")
             log.info("  PASS")
 
-        # ── Test 12: Drain-aware routing ───────────────────────────────
-        log.info("TEST 12: Drain-aware routing")
+        # ── Test 13: Drain-aware routing ───────────────────────────────
+        log.info("TEST 13: Drain-aware routing")
         async with httpx.AsyncClient(timeout=30) as client:
             await client.post(f"{url}/scale/drain", json={"role": "decode", "idx": 0})
             resp = await client.post(f"{url}/v1/chat/completions", json={
@@ -358,8 +391,8 @@ async def smoke_test(mode: str = _TRANSFER_MODE):
                               json={"role": "decode", "idx": 0})
             log.info("  PASS")
 
-        # ── Test 13: Scale events ──────────────────────────────────────
-        log.info("TEST 13: Scale events history")
+        # ── Test 14: Scale events ──────────────────────────────────────
+        log.info("TEST 14: Scale events history")
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(f"{url}/scale/events")
             assert resp.status_code == 200, f"Events: {resp.status_code}"
@@ -369,7 +402,7 @@ async def smoke_test(mode: str = _TRANSFER_MODE):
             log.info("  PASS")
 
         log.info("=" * 60)
-        log.info("ALL 13 TESTS PASSED (2P + 2D, %s mode)", mode)
+        log.info("ALL 14 TESTS PASSED (2P + 2D, %s mode)", mode)
         log.info("=" * 60)
         return {"status": "passed", "mode": mode}
 
