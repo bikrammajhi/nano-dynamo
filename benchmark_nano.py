@@ -4,18 +4,18 @@ from pathlib import Path
 import modal
 
 _MODEL = "Qwen/Qwen2.5-3B-Instruct"
-_BLOCK_SIZE = 16
-_MAX_MODEL_LEN = 8192
+_BLOCK_SIZE = 64
+_MAX_MODEL_LEN = 32768
 INPUT_TOKENS = 256
 OUTPUT_TOKENS = 128
 
 _REPO_ROOT = Path(__file__).resolve().parent
 
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python="3.12")
+    modal.Image.from_registry("nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04", add_python="3.12")
     .apt_install("git", "wget", "curl", "build-essential")
+    .uv_pip_install("vllm>=0.7.2", pre="--prerelease=allow")
     .pip_install(
-        "vllm>=0.26.0",
         "nixl", "xxhash", "transformers>=4.40", "huggingface-hub",
         "httpx", "fastapi", "uvicorn", "sse-starlette", "aiperf",
     )
@@ -136,7 +136,7 @@ async def run_benchmark(scenario: str = "all", num_prefill: int = 2, num_decode:
                 f"{sys.executable} -m vllm.entrypoints.openai.api_server "
                 f"--model {_MODEL} --port {port} --gpu-memory-utilization 0.85 "
                 f"--max-model-len {_MAX_MODEL_LEN} --block-size {_BLOCK_SIZE} "
-                f"--dtype auto --enforce-eager "
+                f"--dtype auto "
                 f"--kv-transfer-config '{kv_config}'"
             )
             log.info("Starting PREFILL %d on GPU %d, port %d", i + 1, gpu_id, port)
@@ -158,7 +158,7 @@ async def run_benchmark(scenario: str = "all", num_prefill: int = 2, num_decode:
                 f"{sys.executable} -m vllm.entrypoints.openai.api_server "
                 f"--model {_MODEL} --port {port} --gpu-memory-utilization 0.85 "
                 f"--max-model-len {_MAX_MODEL_LEN} --block-size {_BLOCK_SIZE} "
-                f"--dtype auto --enforce-eager "
+                f"--dtype auto "
                 f"--kv-transfer-config '{kv_config}'"
             )
             log.info("Starting DECODE %d on GPU %d, port %d", i + 1, gpu_id, port)
@@ -214,23 +214,28 @@ async def run_benchmark(scenario: str = "all", num_prefill: int = 2, num_decode:
                     ttft = result.get("time_to_first_token", {}).get("avg", 0)
                     tp = result.get("output_token_throughput", {}).get("avg", 0)
                     lat = result.get("request_latency", {}).get("avg", 0)
-                    log.info("  TTFT=%.0fms  tok/s=%.0f  lat=%.0fms", ttft, tp, lat)
+                    gp = result.get("goodput", {}).get("avg", 0)
+                    log.info("  TTFT=%.0fms  tok/s=%.0f  lat=%.0fms  goodput=%.1f", ttft, tp, lat, gp)
                 else:
                     all_results[name] = {}
 
     finally:
         kill_procs(procs)
 
-    log.info("=" * 60)
-    log.info("NANO-DYNAMO RESULTS: %dP+%dD", num_prefill, num_decode)
-    log.info("=" * 60)
+    log.info("=" * 70)
+    log.info("NANO-DYNAMO BENCHMARK: %dP+%dD, %s", num_prefill, num_decode, _MODEL)
+    log.info("=" * 70)
+    header = f"{'Scenario':<20} {'TTFT(ms)':>10} {'tok/s':>10} {'Lat(ms)':>10} {'Goodput':>10}"
+    log.info(header)
+    log.info("-" * 65)
     for name in all_results:
         r = all_results[name]
         ttft = r.get("time_to_first_token", {}).get("avg", 0)
         tp = r.get("output_token_throughput", {}).get("avg", 0)
         lat = r.get("request_latency", {}).get("avg", 0)
-        log.info("  %-18s  TTFT=%6.0fms  tok/s=%6.0f  lat=%6.0fms", name, ttft, tp, lat)
-    log.info("=" * 60)
+        gp = r.get("goodput", {}).get("avg", 0)
+        log.info("  %-18s %10.0f %10.0f %10.0f %10.1f", name, ttft, tp, lat, gp)
+    log.info("=" * 70)
 
     return all_results
 
