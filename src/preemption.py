@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
 from .kvbm import MigrationManager
@@ -152,16 +152,6 @@ class PreemptionManager:
                      conv_id[:8], record.original_d_idx, len(record.block_hashes))
             self._session_hashes.pop(conv_id, None)
         return record
-
-    def session_overlap(self, conv_id: str, d_idx: int) -> int:
-        """Check overlap between a session's blocks and a worker."""
-        hashes = self._session_hashes.get(conv_id)
-        if hashes:
-            return self.migration.registry.overlap_decode(d_idx, hashes)
-        return 0
-
-    def active_sessions(self, d_idx: int) -> int:
-        return len(self._worker_sessions.get(d_idx, {}))
 
     def preempted_count(self) -> int:
         return len(self._preempted)
