@@ -72,6 +72,7 @@ class BlockPool:
         ]
         self._free: deque = deque(range(total_blocks))
         self._committed_index: Dict[LocalBlockHash, BlockId] = {}
+        self._eviction_queue: deque[LocalBlockHash] = deque()
 
     @property
     def available(self) -> AvailableBlocks:
@@ -82,11 +83,26 @@ class BlockPool:
         count = sum(1 for b in self.blocks if b is not None and b.state == KvBlockState.INFLIGHT)
         return InflightBlocks(count=count, max_count=self.total_blocks)
 
+    def _evict_until_free(self, needed: int) -> None:
+        while len(self._free) < needed and self._eviction_queue:
+            h = self._eviction_queue.popleft()
+            bid = self._committed_index.pop(h, None)
+            if bid is None:
+                continue
+            idx = bid.value
+            block = self.blocks[idx]
+            if block is not None and block.state == KvBlockState.COMMITTED:
+                block.state = KvBlockState.FREE
+                block.block_hash = None
+                self._free.append(idx)
+
     def allocate(self, count: int) -> List[BlockId]:
         if count < 0:
             raise ValueError(f"count must be non-negative, got {count}")
         if count == 0:
             return []
+
+        self._evict_until_free(count)
 
         if len(self._free) < count:
             raise RuntimeError(
@@ -132,6 +148,8 @@ class BlockPool:
                     old_block.state = KvBlockState.FREE
                     old_block.block_hash = None
                     self._free.append(old_bid.value)
+        else:
+            self._eviction_queue.append(block_hash)
         block.state = KvBlockState.COMMITTED
         block.block_hash = block_hash
         self._committed_index[block_hash] = block_id

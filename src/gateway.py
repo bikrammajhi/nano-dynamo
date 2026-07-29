@@ -8,21 +8,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 import threading
-import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .prefill import DisaggregatedRouter
 from .types import WorkerId, WorkerLoad
 from .radix_tree import (
     KvIndexer, RouterEvent, KvCacheEvent, KvCacheEventData,
-    KvCacheStoreData, KvCacheStoredBlockData, ExternalSequenceBlockHash,
+    KvCacheStoredBlockData, ExternalSequenceBlockHash,
     compute_block_hash_for_seq,
 )
 from .scheduler import KvScheduler, SchedulerConfig
@@ -83,51 +82,6 @@ class WorkerState:
             pass
 
 
-# ── Disaggregation decision (adapted from src/prefill.py) ─────────────
-
-@dataclass
-class DisaggregationDecision:
-    should_prefill_remote: bool
-    remote_worker_id: Optional[int]
-    effective_prefill_length: int
-
-
-def _decide_disagg(
-    token_ids: List[int],
-    local_worker_id: int,
-    block_pools: Dict[int, BlockPool],
-    worker_states: Dict[int, WorkerState],
-    block_size: int,
-    max_local_prefill_length: int = 512,
-    queue_depth_threshold: int = 4,
-) -> DisaggregationDecision:
-    """Decide local vs remote prefill using BlockPool prefix matching."""
-    total_tokens = len(token_ids)
-
-    prefix_hit_tokens = 0
-    pool = block_pools.get(local_worker_id)
-    if pool:
-        block_hashes = compute_block_hash_for_seq(token_ids, block_size)
-        matched = pool.match_blocks(block_hashes)
-        prefix_hit_tokens = matched.cached_count * block_size
-
-    effective_prefill = max(0, total_tokens - prefix_hit_tokens)
-    local_queue = worker_states[local_worker_id].active_requests
-
-    if effective_prefill <= max_local_prefill_length and local_queue < queue_depth_threshold:
-        return DisaggregationDecision(False, None, effective_prefill)
-
-    # Pick least-loaded prefill worker as remote candidate
-    candidates = sorted(
-        [(wid, ws.active_requests) for wid, ws in worker_states.items() if wid != local_worker_id],
-        key=lambda x: x[1],
-    )
-    if not candidates:
-        return DisaggregationDecision(False, None, effective_prefill)
-
-    return DisaggregationDecision(True, candidates[0][0], effective_prefill)
-
-
 # ── Core gateway ──────────────────────────────────────────────────────
 
 class KvRouterGateway:
@@ -155,14 +109,20 @@ class KvRouterGateway:
             indexer=self.indexer,
             block_size=block_size,
         )
+        worker_ids = [WorkerId(i) for i in range(len(prefill_urls))]
         self.block_pools = {i: BlockPool(total_blocks=max_kv_blocks, block_size=block_size) for i in range(len(prefill_urls))}
+        self.disagg_router = DisaggregatedRouter(
+            worker_ids=worker_ids,
+            block_pools={wid: self.block_pools[wid.value] for wid in worker_ids},
+            block_size=block_size,
+            max_local_prefill_length=max_local_prefill_length,
+        )
 
         self.tokenizer = _get_tokenizer(model_name)
 
         self._req_counter = 0
         self._req_worker: Dict[str, int] = {}
         self._req_tokens: Dict[str, List[int]] = {}
-        self._max_local_prefill = max_local_prefill_length
 
         log.info("Gateway: %d prefill + %d decode workers, block_size=%d", len(prefill_urls), len(decode_urls), block_size)
 
@@ -184,12 +144,12 @@ class KvRouterGateway:
         wid = worker_id.value
 
         # 2. Disaggregation decision
-        decision = _decide_disagg(
-            token_ids, wid, self.block_pools, self.prefill_states,
-            self.block_size, self._max_local_prefill,
+        worker_loads = {WorkerId(k): v.active_requests for k, v in self.prefill_states.items()}
+        decision = self.disagg_router.should_prefill_remote(
+            token_ids, WorkerId(wid), worker_loads,
         )
         if decision.should_prefill_remote and decision.remote_worker_id is not None:
-            wid = decision.remote_worker_id
+            wid = decision.remote_worker_id.value
 
         self._req_counter += 1
         req_id = f"req-{self._req_counter}"

@@ -129,23 +129,22 @@ class VllmBlockPoolSync:
 
 
 @dataclass
-class NixlTransferParams:
+class PrefillResult:
     request_id: str
-    kv_transfer_params: dict
     prefill_worker_id: int
     decode_worker_id: int
     num_tokens: int
     timestamp: float = 0.0
 
 
-class VllmNixlOrchestrator:
+class VllmHttpOrchestrator:
     def __init__(self, workers: Dict[int, VllmWorkerState], timeout: float = 120.0):
         self.workers = workers
         self.timeout = timeout
 
     async def run_prefill(self, worker_id: int, model: str, prompt: str,
                           max_tokens: int = 1, temperature: float = 0.6,
-                          top_p: float = 1.0) -> Optional[NixlTransferParams]:
+                          top_p: float = 1.0) -> Optional[PrefillResult]:
         state = self.workers.get(worker_id)
         if state is None:
             logger.error("Prefill failed: worker %d not found", worker_id)
@@ -160,9 +159,8 @@ class VllmNixlOrchestrator:
             if "choices" not in resp:
                 logger.warning("Prefill on worker %d returned no choices", worker_id)
                 return None
-            return NixlTransferParams(
+            return PrefillResult(
                 request_id=f"prefill_{worker_id}_{int(time.time()*1000)}",
-                kv_transfer_params={"status": "prefill_complete"},
                 prefill_worker_id=worker_id, decode_worker_id=-1,
                 num_tokens=len(prompt.split()), timestamp=time.time())
         except Exception as e:
@@ -170,9 +168,8 @@ class VllmNixlOrchestrator:
             return None
 
     async def run_decode(self, worker_id: int, model: str, prompt: str,
-                         kv_params: NixlTransferParams, max_tokens: int = 128,
-                         temperature: float = 0.6, top_p: float = 1.0,
-                         stream: bool = True) -> Optional[str]:
+                         max_tokens: int = 128, temperature: float = 0.6,
+                         top_p: float = 1.0, stream: bool = True) -> Optional[str]:
         state = self.workers.get(worker_id)
         if state is None:
             logger.error("Decode failed: worker %d not found", worker_id)
@@ -209,17 +206,16 @@ class VllmNixlOrchestrator:
     async def transfer_kv(self, prefill_worker_id: int, decode_worker_id: int,
                           model: str, prompt: str, max_tokens: int = 128,
                           temperature: float = 0.6, top_p: float = 1.0
-                          ) -> Tuple[Optional[str], Optional[NixlTransferParams]]:
-        kv_params = await self.run_prefill(worker_id=prefill_worker_id, model=model,
-                                           prompt=prompt, max_tokens=1,
-                                           temperature=temperature, top_p=top_p)
-        if kv_params is None:
+                          ) -> Tuple[Optional[str], Optional[PrefillResult]]:
+        result = await self.run_prefill(worker_id=prefill_worker_id, model=model,
+                                        prompt=prompt, max_tokens=1,
+                                        temperature=temperature, top_p=top_p)
+        if result is None:
             return None, None
-        kv_params.decode_worker_id = decode_worker_id
+        result.decode_worker_id = decode_worker_id
         text = await self.run_decode(worker_id=decode_worker_id, model=model, prompt=prompt,
-                                     kv_params=kv_params, max_tokens=max_tokens,
-                                     temperature=temperature, top_p=top_p)
-        return text, kv_params
+                                     max_tokens=max_tokens, temperature=temperature, top_p=top_p)
+        return text, result
 
     def _http_post(self, url: str, payload: bytes) -> str:
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
