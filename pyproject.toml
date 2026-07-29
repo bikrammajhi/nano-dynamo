@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-dynamo"
+name = "kv-prefix-router"
 version = "0.1.0"
-description = "Minimal reimplementation of NVIDIA Dynamo's KV-aware routing core"
+description = "Educational HTTP proxy demonstrating prefix-aware LLM request routing via radix tree and cost function"
 requires-python = ">=3.10"
 
 dependencies = [

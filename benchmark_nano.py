@@ -1,7 +1,6 @@
 from __future__ import annotations
 import asyncio, json, logging, os, subprocess, sys, threading, time
 from pathlib import Path
-from typing import List
 import modal
 
 _MODEL = "Qwen/Qwen2.5-3B-Instruct"
@@ -223,5 +222,5 @@ async def run_benchmark(scenario: str = "all", num_prefill: int = 2, num_decode:
 
 @app.local_entrypoint()
 def main(scenario: str = "all", num_prefill: int = 2, num_decode: int = 2):
-    print(f"nano-dynamo benchmark | {num_prefill}P + {num_decode}D | {scenario}")
+    print(f"kv-prefix-router benchmark | {num_prefill}P + {num_decode}D | {scenario}")
     run_benchmark.remote(scenario, num_prefill, num_decode)

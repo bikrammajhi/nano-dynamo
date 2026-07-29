@@ -1,9 +1,8 @@
 from __future__ import annotations
-import math
 import random
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from .types import WorkerId, WorkerLoad
 from .radix_tree import KvIndexer, OverlapScores
@@ -11,12 +10,8 @@ from .radix_tree import KvIndexer, OverlapScores
 
 @dataclass(frozen=True)
 class SchedulerConfig:
-    overlap_score_credit: float = 1.0
-    overlap_score_credit_decay: float = 0.0
-    prefill_load_scale: float = 1.0
-    router_temperature: float = 0.0
+    overlap_weight: float = 2.0
     max_requests_per_worker: int = 16
-    active_prefill_decay_factor: float = 0.9
 
 
 @dataclass
@@ -42,11 +37,6 @@ class RequestQueue:
         self._queue.append(request)
         return True
 
-    def dequeue(self) -> Optional[QueuedRequest]:
-        if self._queue:
-            return self._queue.popleft()
-        return None
-
     def __len__(self) -> int:
         return len(self._queue)
 
@@ -54,64 +44,33 @@ class RequestQueue:
         return bool(self._queue)
 
 
-def _softmax_sample(logits: Dict[int, float], temperature: float) -> Tuple[int, float]:
-    if not logits:
-        raise ValueError("Empty logits for softmax sampling")
-    if temperature == 0.0:
-        best_worker = min(logits, key=lambda w: logits[w])
-        return best_worker, logits[best_worker]
-
-    workers = list(logits.keys())
-    values = [logits[w] for w in workers]
-    min_val, max_val = min(values), max(values)
-
-    if min_val == max_val:
-        idx = random.randint(0, len(workers) - 1)
-        return workers[idx], values[idx]
-
-    scale = -1.0 / ((max_val - min_val) * temperature)
-    max_scaled = min_val * scale
-    probs = [math.exp(v * scale - max_scaled) for v in values]
-    total = sum(probs)
-    probs = [p / total for p in probs]
-
-    sample = random.random()
-    cumsum = 0.0
-    for i, prob in enumerate(probs):
-        cumsum += prob
-        if sample <= cumsum:
-            return workers[i], values[i]
-    return workers[-1], values[-1]
-
-
 @dataclass
 class KvScheduler:
     config: SchedulerConfig = field(default_factory=SchedulerConfig)
     indexer: KvIndexer | None = None
     block_size: int = 16
-    _active_prefill_tokens: Dict[int, float] = field(default_factory=dict)
     _queue: RequestQueue = field(default_factory=RequestQueue)
 
     def _compute_worker_logit(
         self, isl_blocks: float, worker_load: WorkerLoad,
-        overlap_signals: OverlapSignals, min_active_prefill_tokens: float
+        overlap_signals: OverlapSignals, max_waiting: int
     ) -> float:
         wid = worker_load.worker_id.value
-        device_blocks = overlap_signals.overlap_blocks.get(wid, 0)
-        credit = self.config.overlap_score_credit * device_blocks
+        matching_blocks = overlap_signals.overlap_blocks.get(wid, 0)
+        score = matching_blocks / isl_blocks if isl_blocks > 0 else 0.0
 
-        if self.config.overlap_score_credit_decay > 0.0:
-            excess_blocks = (worker_load.active_prefill_tokens - min_active_prefill_tokens) / self.block_size
-            req_blocks = max(1, worker_load.kv_cache_total_blocks)
-            credit /= 1.0 + self.config.overlap_score_credit_decay * (excess_blocks / req_blocks)
-
-        cached_tokens = overlap_signals.effective_cached_tokens.get(wid, 0)
-        raw_prefill_tokens = worker_load.active_prefill_tokens + max(
-            0, (isl_blocks * self.block_size) - cached_tokens
+        total_blocks = worker_load.kv_cache_total_blocks
+        cache_usage = (
+            worker_load.kv_cache_used_blocks / total_blocks
+            if total_blocks > 0 else 0.0
         )
-        adjusted = max(0.0, raw_prefill_tokens / self.block_size - credit)
 
-        return self.config.prefill_load_scale * adjusted + float(worker_load.potential_decode_blocks())
+        waiting = (
+            worker_load.active_requests / max_waiting
+            if max_waiting > 0 else 0.0
+        )
+
+        return self.config.overlap_weight * score - cache_usage - waiting
 
     def select_worker(
         self, token_ids: List[int], worker_loads: Dict[WorkerId, WorkerLoad]
@@ -148,32 +107,18 @@ class KvScheduler:
             self._queue.enqueue(QueuedRequest(token_ids=token_ids, worker_loads=worker_loads))
             return None
 
-        min_active = float("inf")
-        if self.config.overlap_score_credit_decay > 0.0:
-            min_active = min(load.active_prefill_tokens for _, load in candidates)
-            if min_active == float("inf"):
-                min_active = 0.0
+        max_waiting = max(load.active_requests for _, load in candidates)
 
         worker_logits = {
-            wid.value: self._compute_worker_logit(isl_blocks, load, overlap_signals, min_active)
+            wid.value: self._compute_worker_logit(isl_blocks, load, overlap_signals, max_waiting)
             for wid, load in candidates
         }
 
-        selected_id, _ = _softmax_sample(worker_logits, self.config.router_temperature)
-
-        decay = self.config.active_prefill_decay_factor
-        current = self._active_prefill_tokens.get(selected_id, 0.0)
-        self._active_prefill_tokens[selected_id] = decay * current + (1.0 - decay) * isl_tokens
+        max_logit = max(worker_logits.values())
+        best_workers = [wid for wid, logit in worker_logits.items() if logit == max_logit]
+        selected_id = random.choice(best_workers)
 
         return WorkerId(selected_id)
 
     def update_worker_loads(self, worker_loads: Dict[WorkerId, WorkerLoad]) -> None:
-        decay = self.config.active_prefill_decay_factor
-        for wid, load in worker_loads.items():
-            current = self._active_prefill_tokens.get(wid.value, 0.0)
-            self._active_prefill_tokens[wid.value] = current * decay
-            load.active_prefill_tokens = int(current * decay)
-
-    def process_completed_request(self, worker_id: WorkerId, tokens_processed: int) -> None:
-        current = self._active_prefill_tokens.get(worker_id.value, 0.0)
-        self._active_prefill_tokens[worker_id.value] = max(0.0, current - tokens_processed)
+        pass
