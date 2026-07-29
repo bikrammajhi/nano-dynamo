@@ -45,12 +45,22 @@ class KvCacheStoreData:
 
 
 @dataclass
+class KvCacheRemovedData:
+    block_hashes: List[ExternalSequenceBlockHash]
+
+
+@dataclass
 class KvCacheEventData:
-    Stored: KvCacheStoreData
+    Stored: KvCacheStoreData | None = None
+    Removed: KvCacheRemovedData | None = None
 
     @staticmethod
     def stored(parent_hash: Optional[ExternalSequenceBlockHash], blocks: List[KvCacheStoredBlockData]) -> "KvCacheEventData":
         return KvCacheEventData(Stored=KvCacheStoreData(parent_hash=parent_hash, blocks=blocks))
+
+    @staticmethod
+    def removed(block_hashes: List[ExternalSequenceBlockHash]) -> "KvCacheEventData":
+        return KvCacheEventData(Removed=KvCacheRemovedData(block_hashes=block_hashes))
 
 
 @dataclass
@@ -107,19 +117,26 @@ class RadixTree:
         op = event.event.data
         worker_lookup = self.lookup.setdefault(worker_id, {})
 
-        store = op.Stored
-        current = worker_lookup.get(store.parent_hash) if store.parent_hash is not None else None
-        if current is None:
-            current = self.root
+        if op.Stored is not None:
+            store = op.Stored
+            current = worker_lookup.get(store.parent_hash) if store.parent_hash is not None else None
+            if current is None:
+                current = self.root
 
-        for block_id in store.blocks:
-            block = current.children.get(block_id.tokens_hash)
-            if block is None:
-                block = worker_lookup.get(block_id.block_hash) or RadixBlock()
-                current.children[block_id.tokens_hash] = block
-            block.workers.add(worker_id)
-            worker_lookup[block_id.block_hash] = block
-            current = block
+            for block_id in store.blocks:
+                block = current.children.get(block_id.tokens_hash)
+                if block is None:
+                    block = worker_lookup.get(block_id.block_hash) or RadixBlock()
+                    current.children[block_id.tokens_hash] = block
+                block.workers.add(worker_id)
+                worker_lookup[block_id.block_hash] = block
+                current = block
+
+        if op.Removed is not None:
+            for bh in op.Removed.block_hashes:
+                block = worker_lookup.pop(bh, None)
+                if block is not None:
+                    block.workers.discard(worker_id)
 
     def remove_worker(self, worker_id: int) -> None:
         if worker_id not in self.lookup:

@@ -7,10 +7,14 @@ with HTTP proxy to external vLLM instances.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
+
+import zmq
+import zmq.asyncio
 
 import httpx
 import uvicorn
@@ -93,11 +97,13 @@ class KvRouterGateway:
         block_size: int = 64,
         max_kv_blocks: int = 100,
         max_local_prefill_length: int = 512,
+        kv_events_ports: Optional[List[int]] = None,
     ):
         self.prefill_urls = prefill_urls
         self.decode_urls = decode_urls
         self.block_size = block_size
         self.model_name = model_name
+        self.kv_events_ports = kv_events_ports or []
 
         self.prefill_states = {i: WorkerState(url) for i, url in enumerate(prefill_urls)}
         self.decode_states = {i: WorkerState(url) for i, url in enumerate(decode_urls)}
@@ -125,7 +131,8 @@ class KvRouterGateway:
         self._req_block_hashes: Dict[str, List[LocalBlockHash]] = {}
         self._req_decode: Dict[str, Optional[int]] = {}
 
-        log.info("Gateway: %d prefill + %d decode workers, block_size=%d", len(prefill_urls), len(decode_urls), block_size)
+        log.info("Gateway: %d prefill + %d decode workers, block_size=%d, kv_events=%s",
+                 len(prefill_urls), len(decode_urls), block_size, bool(self.kv_events_ports))
 
     def _get_worker_loads(self) -> Dict[WorkerId, WorkerLoad]:
         return {WorkerId(wid): ws.to_worker_load(wid) for wid, ws in self.prefill_states.items()}
@@ -212,6 +219,64 @@ class KvRouterGateway:
         for bid, bh in zip(block_ids, block_hashes):
             pool.commit(bid, bh)
 
+    async def _kv_events_listener(self, worker_id: int, port: int):
+        """Subscribe to vLLM KV events via ZMQ and update the radix tree in real-time."""
+        ctx = zmq.asyncio.Context()
+        socket = ctx.socket(zmq.SUB)
+        socket.connect(f"tcp://127.0.0.1:{port}")
+        socket.subscribe("kv-events")
+        log.info("ZMQ subscriber for worker_%d connected to port %d", worker_id, port)
+        while True:
+            try:
+                _, payload = await socket.recv_multipart()
+                msg: dict[str, Any] = json.loads(payload)
+                event_id = msg.get("event_id", 0)
+                etype = msg.get("type", "")
+                blocks_raw = msg.get("blocks", [])
+
+                if etype == "stored":
+                    blocks = [
+                        KvCacheStoredBlockData(
+                            tokens_hash=LocalBlockHash(b["token_hash"]),
+                            block_hash=ExternalSequenceBlockHash(b["block_hash"]),
+                        )
+                        for b in blocks_raw if "token_hash" in b and "block_hash" in b
+                    ]
+                    if not blocks:
+                        continue
+                    parent_hash_raw = msg.get("parent_hash")
+                    parent_hash = ExternalSequenceBlockHash(parent_hash_raw) if parent_hash_raw is not None else None
+                    event = RouterEvent(
+                        worker_id=worker_id,
+                        event=KvCacheEvent(
+                            event_id=event_id,
+                            data=KvCacheEventData.stored(parent_hash=parent_hash, blocks=blocks),
+                        ),
+                    )
+                    self.indexer.apply_event(event)
+                    log.debug("ZMQ stored: worker_%d %d blocks (event=%d)", worker_id, len(blocks), event_id)
+
+                elif etype == "removed":
+                    block_hashes = [
+                        ExternalSequenceBlockHash(b["block_hash"])
+                        for b in blocks_raw if "block_hash" in b
+                    ]
+                    if not block_hashes:
+                        continue
+                    event = RouterEvent(
+                        worker_id=worker_id,
+                        event=KvCacheEvent(
+                            event_id=event_id,
+                            data=KvCacheEventData.removed(block_hashes=block_hashes),
+                        ),
+                    )
+                    self.indexer.apply_event(event)
+                    log.debug("ZMQ removed: worker_%d %d blocks (event=%d)", worker_id, len(block_hashes), event_id)
+
+            except Exception:
+                log.exception("ZMQ subscriber error for worker_%d", worker_id)
+                await asyncio.sleep(1)
+
     async def _update_loads(self):
         while True:
             all_states = list(self.prefill_states.values()) + list(self.decode_states.values())
@@ -261,16 +326,19 @@ def _make_proxy_handler(endpoint: str):
     return handler
 
 
-def create_app(prefill_ports: List[int], decode_ports: List[int], **kwargs) -> FastAPI:
+def create_app(prefill_ports: List[int], decode_ports: List[int], kv_events_ports: Optional[List[int]] = None, **kwargs) -> FastAPI:
     app = FastAPI(title="Nano-Dynamo KV Router")
     prefill_urls = [f"http://127.0.0.1:{p}" for p in prefill_ports]
     decode_urls = [f"http://127.0.0.1:{p}" for p in decode_ports]
 
-    app.state.gateway = KvRouterGateway(prefill_urls, decode_urls, **kwargs)
+    app.state.gateway = KvRouterGateway(prefill_urls, decode_urls, kv_events_ports=kv_events_ports, **kwargs)
 
     @app.on_event("startup")
     async def startup():
-        asyncio.create_task(app.state.gateway._update_loads())
+        gw = app.state.gateway
+        asyncio.create_task(gw._update_loads())
+        for i, port in enumerate(gw.kv_events_ports):
+            asyncio.create_task(gw._kv_events_listener(i, port))
 
     @app.get("/v1/models")
     async def list_models():
@@ -294,9 +362,12 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--max-local-prefill", type=int, default=512)
+    parser.add_argument("--kv-events-ports", type=int, nargs="*", default=None,
+                        help="ZMQ ports for vLLM KV events (one per prefill worker)")
     args = parser.parse_args()
 
     uvicorn.run(
-        create_app(args.prefill_ports, args.decode_ports, model_name=args.model, max_local_prefill_length=args.max_local_prefill),
+        create_app(args.prefill_ports, args.decode_ports, kv_events_ports=args.kv_events_ports,
+                   model_name=args.model, max_local_prefill_length=args.max_local_prefill),
         host=args.host, port=args.port,
     )
