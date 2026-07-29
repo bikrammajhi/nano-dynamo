@@ -1,6 +1,6 @@
 # kv-prefix-router
 
-LLM inference is slow. One reason: when multiple requests share a prefix (like a system prompt), the first request computes a KV cache, and every subsequent request recomputes it from scratch. NVIDIA Dynamo fixes this by routing requests to workers that already have the cache. This project demonstrates that **one specific idea** — prefix-aware worker selection via a radix tree and cost function — in ~900 lines of Python.
+An educational HTTP proxy that implements NVIDIA Dynamo's prefix-aware KV routing in ~900 lines of Python. Useful for understanding how disaggregated inference routing works — not for production.
 
 ## The problem
 
@@ -103,23 +103,40 @@ After picking a prefill GPU, the router checks: is the remaining work too big? I
 
 ## Comparison with NVIDIA Dynamo
 
-| Dimension | kv-prefix-router | NVIDIA Dynamo |
+### What we both do
+
+- **Same cost function**: `logit = 2 × overlap_ratio - cache_usage - waiting`, select argmax
+- **Same data structure**: radix tree of token block hashes to track which workers have which prefixes
+- **Same disaggregation concept**: decide local vs remote prefill based on effective new tokens
+- **Same block lifecycle**: allocate → compute → commit, with dedup on hash collision
+
+### What we have that Dynamo does differently
+
+| Aspect | kv-prefix-router | NVIDIA Dynamo |
 |---|---|---|
-| **Codebase** | ~900 lines of Python, 7 files | ~100,000+ lines, Python + C++/CUDA |
-| **Design goal** | Educational — illustrate the routing concept | Production — deploy at scale |
-| **Protocol** | HTTP/1.1 + JSON | gRPC + protobuf (binary, ~10x smaller) |
-| **Cost function** | Same: `2×overlap - cache_usage - waiting` | Same formula in `kv_router.py` |
 | **Prefix index** | Pure Python radix tree | Native C++ `KvIndexer` (`dynamo._core`) |
-| **KV transfer** | Delegated to vLLM's NixlConnector | `DynamoNixlConnector` with Triton kernel |
-| **Metrics** | Pull (Prometheus scrape, up to 2s stale) | Push (ZMQ pub/sub, near real-time) |
-| **Service discovery** | Static ports | Dynamic (etcd or file-based) |
-| **Routing modes** | KV-aware only | `random`, `round-robin`, `kv` |
-| **Worker scope** | Prefill only | Prefill + decode |
-| **Request queue** | In-memory deque (max 1000) | NATS JetStream (distributed, persistent) |
-| **Fault tolerance** | None | Leader election, failover |
-| **Autoscaling** | None | K8s CRD with min/max replicas |
-| **Deployment** | `python -m src.gateway` | `dynamo serve`, `dynamo deploy` to K8s |
-| **Auth/TLS** | None | Full production stack |
+| **Protocol** | HTTP/1.1 + JSON | gRPC + protobuf |
+| **Metrics** | Pull (Prometheus scrape, 2s resolution) | Push (ZMQ pub/sub, real-time) |
+| **Codebase** | ~900 lines, 7 files | ~100,000+ lines, C++/CUDA + Python |
+
+### What Dynamo has that we don't
+
+| Feature | Dynamo implementation | Impact |
+|---------|----------------------|--------|
+| **GPU-direct KV transfer** | `DynamoNixlConnector` with Triton kernel for TP-aware tensor rearrangement | Dynamo transfers KV cache across GPUs without touching CPU. We delegate to vLLM's startup flag. |
+| **Event-driven KV index** | `KVCacheEventManager` C library publishes block allocator events (store/remove) via ZMQ in real time | Dynamo's radix tree updates instantly on every block allocation. Ours only updates on request completion. |
+| **Multi-service pipeline** | `Frontend → Processor → Router → Worker` as separate, linkable services | Dynamo's architecture is modular and distributed. Ours is a monolithic gateway. |
+| **Multiple routing modes** | `random`, `round-robin`, `kv` | Dynamo can fall back to simpler strategies. Ours is KV-only with no fallback. |
+| **Decode worker selection** | Router selects both prefill and decode placement | Dynamo can optimize which GPU decodes. We only route prefill. |
+| **Persistent request queue** | NATS JetStream (distributed, survives crashes) | Dynamo doesn't lose queued requests on failure. Ours is an in-memory deque. |
+| **Service discovery** | etcd or file-based dynamic registration | Dynamo handles worker joins/leaves at runtime. Ours is static CLI ports. |
+| **Real-time worker metrics** | Push-based ZMQ, sub-second latency | Dynamo's cost function sees fresher data. Ours polls every 2s. |
+| **Production deployment** | `dynamo serve` / `dynamo deploy` to K8s with CRD | Dynamo has autoscaling, health checks, graceful shutdown, canary deployments. |
+| **Fault tolerance** | Leader election + failover via etcd | Dynamo survives worker crashes. Ours drops the request. |
+| **Auth / TLS** | BentoML Cloud auth + SSL cert support | Dynamo can run in production behind auth. Ours has none. |
+| **Prefix cache hit rate** | `gpu_prefix_cache_hit_rate` per-worker metric | Dynamo's cost function can weight by hit rate. Ours doesn't track this. |
+| **Native KV event processing** | C++/CUDA `dynamo._core` bindings | Dynamo's index operations are compiled. Ours are pure Python. |
+| **Distributed KV metadata** | etcd-backed `NixlMetadataStore` for NIXL agent discovery | Dynamo coordinates GPU memory metadata across machines. |
 
 ## Project structure
 
