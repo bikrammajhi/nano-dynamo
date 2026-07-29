@@ -173,14 +173,11 @@ class KvRouterGateway:
         if not block_hashes:
             return
 
-        # Commit to BlockPool
+        # Commit to BlockPool (evicts oldest blocks if full)
         pool = self.block_pools[wid]
-        try:
-            block_ids = pool.allocate(len(block_hashes))
-            for bid, bh in zip(block_ids, block_hashes):
-                pool.commit(bid, bh)
-        except RuntimeError:
-            pass  # Pool full — skip, still update radix tree
+        block_ids = pool.allocate(len(block_hashes))
+        for bid, bh in zip(block_ids, block_hashes):
+            pool.commit(bid, bh)
 
         # Update radix tree
         blocks = [KvCacheStoredBlockData(tokens_hash=bh, block_hash=ExternalSequenceBlockHash(bh.value)) for bh in block_hashes]

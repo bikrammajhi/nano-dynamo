@@ -8,18 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Set
 
-from .types import LocalBlockHash
-
-
-@dataclass(frozen=True)
-class BlockId:
-    value: int
-
-    def __hash__(self) -> int:
-        return self.value
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, BlockId) and self.value == other.value
+from .types import BlockId, LocalBlockHash
 
 
 class KvBlockState(str, Enum):
