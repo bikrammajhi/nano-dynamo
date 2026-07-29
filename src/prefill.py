@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
+from .block_pool import BlockPool
+from .radix_tree import compute_block_hash_for_seq
 from .types import WorkerId
-from .engine import Worker
-
-if TYPE_CHECKING:
-    from .kv_transfer import KvCacheTransfer
 
 logger = logging.getLogger(__name__)
 
@@ -24,38 +22,32 @@ class DisaggregationDecision:
 class DisaggregatedRouter:
     def __init__(
         self,
-        workers: dict[WorkerId, Worker],
-        scheduler: Optional["KvScheduler"] = None,
-        block_pools: Optional[dict[WorkerId, "BlockPool"]] = None,
+        worker_ids: list[WorkerId],
+        block_pools: Optional[dict[WorkerId, BlockPool]] = None,
         max_local_prefill_length: int = 512,
         prefill_queue_depth_threshold: int = 4,
         block_size: int = 16,
-        kv_transfer: Optional["KvCacheTransfer"] = None,
     ) -> None:
-        self.workers = workers
-        self.scheduler = scheduler
+        self.worker_ids = list(worker_ids)
         self.block_pools = block_pools or {}
         self.max_local_prefill_length = max_local_prefill_length
         self.prefill_queue_depth_threshold = prefill_queue_depth_threshold
         self.block_size = block_size
-        self.kv_transfer = kv_transfer
-        self._prefill_queue_depths: dict[WorkerId, int] = {wid: 0 for wid in workers}
+        self._prefill_queue_depths: dict[WorkerId, int] = {wid: 0 for wid in worker_ids}
 
     def should_prefill_remote(
         self,
-        request: "Request",
+        token_ids: list[int],
         local_worker_id: WorkerId,
-        overlap: Optional[OverlapScores] = None,
+        worker_loads: dict[WorkerId, int],
     ) -> DisaggregationDecision:
-        token_ids = request.token_ids or []
         total_tokens = len(token_ids)
 
         prefix_hit_tokens = 0
-        if overlap and self.block_pools:
-            pool = self.block_pools.get(local_worker_id)
-            if pool:
-                matched = pool.match_blocks(self._blocks_from_tokens(token_ids))
-                prefix_hit_tokens = matched.cached_count * self.block_size
+        pool = self.block_pools.get(local_worker_id)
+        if pool:
+            matched = pool.match_blocks(compute_block_hash_for_seq(token_ids, self.block_size))
+            prefix_hit_tokens = matched.cached_count * self.block_size
 
         effective_prefill = max(0, total_tokens - prefix_hit_tokens)
 
@@ -73,7 +65,7 @@ class DisaggregatedRouter:
                 effective_prefill_length=effective_prefill,
             )
 
-        remote_worker_id = self._pick_remote_prefill_worker(local_worker_id)
+        remote_worker_id = self._pick_remote_prefill_worker(local_worker_id, worker_loads)
         if remote_worker_id is None:
             return DisaggregationDecision(
                 should_prefill_remote=False,
@@ -89,21 +81,17 @@ class DisaggregatedRouter:
             effective_prefill_length=effective_prefill,
         )
 
-    def _pick_remote_prefill_worker(self, exclude: WorkerId) -> Optional[WorkerId]:
-        candidates = [wid for wid in self.workers if wid != exclude]
+    def _pick_remote_prefill_worker(self, exclude: WorkerId, worker_loads: dict[WorkerId, int]) -> Optional[WorkerId]:
+        candidates = [wid for wid in self.worker_ids if wid != exclude]
         if not candidates:
             return None
         candidates.sort(
             key=lambda wid: (
                 self._prefill_queue_depths.get(wid, 0),
-                self.workers[wid].load.active_requests,
+                worker_loads.get(wid, 0),
             )
         )
         return candidates[0]
 
-    def _blocks_from_tokens(self, token_ids: list[int]) -> list["LocalBlockHash"]:
-        from .radix_tree import compute_block_hash_for_seq
-        return compute_block_hash_for_seq(token_ids, self.block_size)
-
-
-from .block_pool import BlockPool, PrefillMatched  # noqa: E402
+    def update_queue_depth(self, worker_id: WorkerId, depth: int) -> None:
+        self._prefill_queue_depths[worker_id] = depth

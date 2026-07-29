@@ -14,24 +14,14 @@ class SchedulerConfig:
     overlap_score_credit: float = 1.0
     overlap_score_credit_decay: float = 0.0
     prefill_load_scale: float = 1.0
-    host_cache_hit_weight: float = 0.75
-    disk_cache_hit_weight: float = 0.25
     router_temperature: float = 0.0
     max_requests_per_worker: int = 16
     active_prefill_decay_factor: float = 0.9
 
 
 @dataclass
-class TierOverlapBlocks:
-    device: Dict[int, int] = field(default_factory=dict)
-    host_pinned: Dict[int, int] = field(default_factory=dict)
-    disk: Dict[int, int] = field(default_factory=dict)
-
-
-@dataclass
 class OverlapSignals:
-    tier_overlap_blocks: TierOverlapBlocks = field(default_factory=TierOverlapBlocks)
-    effective_overlap_blocks: Dict[int, float] = field(default_factory=dict)
+    overlap_blocks: Dict[int, int] = field(default_factory=dict)
     effective_cached_tokens: Dict[int, int] = field(default_factory=dict)
 
 
@@ -107,16 +97,8 @@ class KvScheduler:
         overlap_signals: OverlapSignals, min_active_prefill_tokens: float
     ) -> float:
         wid = worker_load.worker_id.value
-        tier = overlap_signals.tier_overlap_blocks
-        device_blocks = tier.device.get(wid, 0)
-        host_blocks = tier.host_pinned.get(wid, 0)
-        disk_blocks = tier.disk.get(wid, 0)
-
-        credit = (
-            self.config.overlap_score_credit * device_blocks
-            + self.config.host_cache_hit_weight * host_blocks
-            + self.config.disk_cache_hit_weight * disk_blocks
-        )
+        device_blocks = overlap_signals.overlap_blocks.get(wid, 0)
+        credit = self.config.overlap_score_credit * device_blocks
 
         if self.config.overlap_score_credit_decay > 0.0:
             excess_blocks = (worker_load.active_prefill_tokens - min_active_prefill_tokens) / self.block_size
@@ -131,11 +113,6 @@ class KvScheduler:
 
         return self.config.prefill_load_scale * adjusted + float(worker_load.potential_decode_blocks())
 
-    def _compute_overlap_credit(self, device_blocks: int = 0, host_blocks: int = 0, disk_blocks: int = 0) -> float:
-        return (self.config.overlap_score_credit * device_blocks
-                + self.config.host_cache_hit_weight * host_blocks
-                + self.config.disk_cache_hit_weight * disk_blocks)
-
     def select_worker(
         self, token_ids: List[int], worker_loads: Dict[WorkerId, WorkerLoad]
     ) -> Optional[WorkerId]:
@@ -149,8 +126,7 @@ class KvScheduler:
 
         overlap_signals = OverlapSignals()
         for wid_int, score in overlap.scores.items():
-            overlap_signals.tier_overlap_blocks.device[wid_int] = score
-            overlap_signals.effective_overlap_blocks[wid_int] = float(score)
+            overlap_signals.overlap_blocks[wid_int] = score
             overlap_signals.effective_cached_tokens[wid_int] = score * self.block_size
 
         isl_tokens = len(token_ids)
