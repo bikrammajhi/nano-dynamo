@@ -265,13 +265,16 @@ async def smoke_test(mode: str = _TRANSFER_MODE):
 
 # ── Test 6b: Overlap-based prefill routing feedback loop ──
         log.info("TEST 6b: Overlap-based prefill routing (cache hit bias)")
+        shared_system = "You are a helpful math tutor. Answer the question concisely and accurately. Show your work step by step so the student can follow along."
         p0_before = p0_routes
         p1_before = p1_routes
+        # first request establishes cache on whichever worker it lands on
         async with httpx.AsyncClient(timeout=120) as client:
             for i in range(20):
                 resp = await client.post(f"{url}/v1/chat/completions", json={
                     "model": _MODEL,
                     "messages": [
+                        {"role": "system", "content": shared_system},
                         {"role": "user", "content": f"What is {i+2}*{i+3}?"},
                     ],
                     "max_tokens": 10, "temperature": 0,
@@ -292,8 +295,8 @@ async def smoke_test(mode: str = _TRANSFER_MODE):
         p0_new = p0_after - p0_before
         p1_new = p1_after - p1_before
         log.info("  Overlap requests: P0=%d P1=%d", p0_new, p1_new)
-        log.info("  ✓ Overlap routing bias confirmed: P0 received %d of 20 same-prefix requests", p0_new)
-        assert p0_new >= 18, f"Expected P0 to get >=18 of 20 overlap requests, got {p0_new}"
+        log.info("  ✓ Overlap routing bias confirmed: P0 received %d of 20 same-system-prompt requests", p0_new)
+        assert p0_new >= 18 or p1_new >= 18, f"Expected >=18 of 20 to one worker (same system prompt), got P0={p0_new} P1={p1_new}"
         log.info("  PASS")
 
         # ── Test 8: KVBM decode load tracking ────────────────────────

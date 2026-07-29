@@ -13,15 +13,11 @@ Migration strategy (pragmatic, no vLLM internals changes):
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import random
 import time
-import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
-
-import httpx
 
 log = logging.getLogger("nano-dynamo.kvbm")
 
@@ -33,17 +29,6 @@ class BlockLocation:
     role: str
     last_seen: float = 0.0
     access_count: int = 0
-
-
-@dataclass
-class MigrationPlan:
-    request_id: str
-    source_worker: int
-    source_url: str
-    dest_worker: int
-    dest_url: str
-    block_hashes: List[int]
-    cost_estimate: float = 0.0
 
 
 class BlockLocationRegistry:
@@ -65,21 +50,6 @@ class BlockLocationRegistry:
         loc = self._locations[block_hash][key]
         loc.last_seen = now
         loc.access_count += 1
-
-    def find(self, block_hash: int) -> List[BlockLocation]:
-        return list(self._locations.get(block_hash, {}).values())
-
-    def find_on_decode(self, block_hash: int) -> Optional[int]:
-        for loc in self._locations.get(block_hash, {}).values():
-            if loc.role == "decode":
-                return loc.worker_id
-        return None
-
-    def find_on_prefill(self, block_hash: int) -> Optional[int]:
-        for loc in self._locations.get(block_hash, {}).values():
-            if loc.role == "prefill":
-                return loc.worker_id
-        return None
 
     def worker_blocks(self, worker_id: int, role: str) -> Set[int]:
         blocks: Set[int] = set()
@@ -126,17 +96,28 @@ class MigrationManager:
 
         self._decode_usage: Dict[int, int] = {}
         self._decode_blocks: Dict[int, Set[int]] = {}
-        self._active_migrations: Dict[str, asyncio.Task] = {}
-        self._client: Optional[httpx.AsyncClient] = None
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
-        return self._client
+        self._prefill_tokens: Dict[int, int] = {}
+        self._prefill_requests: Dict[int, int] = {}
 
     def record_prefill_blocks(self, p_idx: int, block_hashes: List[int]):
         for bh in block_hashes:
             self.registry.record(bh, p_idx, "prefill")
+
+    def record_prefill_load(self, p_idx: int, token_count: int):
+        self._prefill_tokens[p_idx] = self._prefill_tokens.get(p_idx, 0) + token_count
+        self._prefill_requests[p_idx] = self._prefill_requests.get(p_idx, 0) + 1
+
+    def release_prefill_load(self, p_idx: int, token_count: int):
+        current = self._prefill_tokens.get(p_idx, 0)
+        self._prefill_tokens[p_idx] = max(0, current - token_count)
+        reqs = self._prefill_requests.get(p_idx, 0)
+        self._prefill_requests[p_idx] = max(0, reqs - 1)
+
+    def active_prefill_tokens(self, p_idx: int) -> int:
+        return self._prefill_tokens.get(p_idx, 0)
+
+    def active_request_count(self, p_idx: int) -> int:
+        return self._prefill_requests.get(p_idx, 0)
 
     def record_decode_blocks(self, d_idx: int, block_hashes: List[int]):
         existing = self._decode_blocks.get(d_idx, set())
@@ -156,29 +137,43 @@ class MigrationManager:
         usage = self._decode_usage.get(d_idx, 0)
         return usage / max(self.decode_cache_capacity, 1)
 
+    def potential_decode_blocks(self, d_idx: int) -> int:
+        return self._decode_usage.get(d_idx, 0)
+
     def best_decode(self, token_hashes: Set[int], exclude: Optional[int] = None,
-                    valid_only: Optional[List[int]] = None) -> Tuple[int, int]:
-        """Pick decode worker with most prefix overlap, breaking ties by load.
+                    valid_only: Optional[List[int]] = None,
+                    overlap_credit: Optional[float] = None) -> Tuple[int, int]:
+        """Pick decode worker with lowest cost (Dynamo-equivalent).
+
+        When overlap_credit is 0 (disaggregated decode mode), selection
+        is purely load-based since KV is being transferred.
 
         Args:
             token_hashes: Set of block hashes to match.
             exclude: Worker index to exclude.
             valid_only: Only consider these worker indices (e.g. not draining).
+            overlap_credit: Overlap credit multiplier (None=use config, 0=no credit).
 
         Returns (worker_idx, overlap_count).
         """
         candidates = valid_only if valid_only is not None else range(len(self.decode_instances))
-        best_idx, best_overlap, best_load = -1, -1, float("inf")
+        best_idx, best_logit, best_overlap = -1, float("inf"), -1
+        tie_count = 0
         for d_idx in candidates:
             if d_idx == exclude:
                 continue
             ov = self.registry.overlap_decode(d_idx, token_hashes)
             load = self._decode_usage.get(d_idx, 0)
-            if ov > best_overlap or (ov == best_overlap and load < best_load):
-                best_idx, best_overlap, best_load = d_idx, ov, load
-            elif ov == best_overlap and load == best_load and best_idx >= 0:
-                if random.random() < 0.5:
-                    best_idx, best_overlap, best_load = d_idx, ov, load
+            effective_credit = overlap_credit if overlap_credit is not None else 1.0
+            adjusted_load = max(load - effective_credit * ov, 0)
+            logit_val = adjusted_load
+            if logit_val < best_logit:
+                best_idx, best_logit, best_overlap = d_idx, logit_val, ov
+                tie_count = 1
+            elif logit_val == best_logit:
+                tie_count += 1
+                if random.randint(0, tie_count - 1) == 0:
+                    best_idx, best_overlap = d_idx, ov
         if best_idx < 0:
             if valid_only:
                 best_idx = min(valid_only, key=lambda i: self._decode_usage.get(i, 0))
@@ -192,38 +187,3 @@ class MigrationManager:
             d_idx for d_idx in range(len(self.decode_instances))
             if self.decode_load(d_idx) >= self.migration_threshold
         ]
-
-    def plan_migration(
-        self,
-        target_decode: int,
-        required_hashes: Set[int],
-    ) -> Optional[MigrationPlan]:
-        existing = self.registry.worker_blocks(target_decode, "decode")
-        missing = required_hashes - existing
-        if not missing:
-            return None
-
-        best_p, best_ov = -1, -1
-        for p_idx in range(len(self.prefill_instances)):
-            p_blocks = self.registry.worker_blocks(p_idx, "prefill")
-            ov = len(missing & p_blocks)
-            if ov > best_ov:
-                best_ov = ov
-                best_p = p_idx
-
-        if best_p < 0 or best_ov == 0:
-            return None
-
-        return MigrationPlan(
-            request_id=str(uuid.uuid4()),
-            source_worker=best_p,
-            source_url=self.prefill_instances[best_p],
-            dest_worker=target_decode,
-            dest_url=self.decode_instances[target_decode],
-            block_hashes=list(missing & self.registry.worker_blocks(best_p, "prefill")),
-            cost_estimate=best_ov,
-        )
-
-    async def close(self):
-        if self._client:
-            await self._client.aclose()
