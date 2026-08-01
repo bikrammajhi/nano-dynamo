@@ -1,15 +1,12 @@
 # nano-dynamo
 
-A KV-aware routing proxy for disaggregated LLM inference — 1,273 lines of Python that runs within 1.35× of NVIDIA Dynamo's TTFT on the same hardware (same model, same load). Built to be read: Dynamo's full router is a compiled Rust service with CUDA kernels; this is the same cost function you can trace in an afternoon.
+A KV-aware routing proxy for disaggregated LLM inference, written to be read: where NVIDIA Dynamo ships a compiled Rust router backed by CUDA kernels, this implements the same cost function in plain Python. The routing logic is the interesting part — [`src/gateway.py`](src/gateway.py), cost function at `gateway.py:92-240`.
 
-> **Flex: the entire gateway is [1,273 lines of Python](src/gateway.py) — 5 files, no C++, no CUDA kernels — yet it lands within 1.35× of NVIDIA Dynamo's TTFT and within 3–9% on throughput/latency (see the benchmark below).**
+> **Flex: the entire gateway is [1,273 lines of Python](src/gateway.py) — 5 files, no C++, no CUDA kernels, no Rust. You can read all of it in an hour.**
 
 ## Benchmark: Nano-Dynamo vs NVIDIA Dynamo
 
-> **TL;DR — a 1,273-line Python gateway is now within 1.35× of NVIDIA Dynamo's TTFT,
-> and within 3–9% on throughput and latency — same 4× A100s,
-> same model, same AIPerf load.** The routing logic is the interesting part:
-> [`src/gateway.py`](src/gateway.py) (cost function at `gateway.py:92-240`).
+> **TL;DR — this gateway lands within 1.35× of NVIDIA Dynamo's TTFT and within 3–9% on throughput and latency — same 4× A100s, same model, same AIPerf load.**
 
 ![Head-to-head benchmark — 2P+2D, Qwen3-14B-FP8](docs/benchmark_2p2d_qwen3_14b.png)
 
