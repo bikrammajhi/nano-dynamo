@@ -46,19 +46,16 @@ def draw(ax, key, ylabel, title, annotate_gap=False):
     ax.set_axisbelow(True)
 
 
-fig, axes = plt.subplots(1, 3, figsize=(14, 4.4))
+fig, axes = plt.subplots(1, 3, figsize=(14, 4.6), constrained_layout=True)
 draw(axes[0], "ttft", "TTFT (ms)", "Time to first token — lower is better", annotate_gap=True)
 draw(axes[1], "tok_s", "Throughput (tok/s)", "Throughput — higher is better", annotate_gap=True)
 draw(axes[2], "lat", "Request latency (ms)", "End-to-end latency — lower is better", annotate_gap=True)
 
-fig.legend(
-    loc="upper center", ncol=2, frameon=False, fontsize=11,
-    bbox_to_anchor=(0.5, 1.0),
-)
+handles, labels = axes[0].get_legend_handles_labels()
+fig.legend(handles, labels, loc="outside lower center", ncol=2, frameon=False, fontsize=11)
 fig.suptitle(
     "Nano-Dynamo vs NVIDIA Dynamo — 2P+2D, Qwen3-14B-FP8, AIPerf (gap = Nano / Dynamo)",
-    y=1.06, fontsize=12,
+    fontsize=12,
 )
-fig.tight_layout()
-fig.savefig(OUT, dpi=150, bbox_inches="tight")
+fig.savefig(OUT, dpi=150)
 print(f"wrote {OUT}")

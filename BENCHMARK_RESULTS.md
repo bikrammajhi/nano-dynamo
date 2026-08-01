@@ -2,8 +2,8 @@
 
 **Tool**: [AIPerf](https://github.com/ai-dynamo/aiperf) (installed via `pip install aiperf`)  
 **Hardware**: 4× NVIDIA A100 (2 Prefill + 2 Decode) on Modal serverless GPUs  
-**Model**: `Qwen/Qwen2.5-3B-Instruct`  
-**Engine**: vLLM ≥0.7.2 (disaggregated prefill/decode with NIXL KV transfer)  
+**Model**: `Qwen/Qwen3-14B-FP8`  
+**Engine**: vLLM 0.26 (disaggregated prefill/decode, push mode via NIXL `NixlPushConnector`)  
 **Block size**: 64 | **Max model len**: 32768  
 **CUDA**: 12.1.0 | **Python**: 3.12  
 
@@ -99,6 +99,12 @@ NVIDIA Dynamo run: https://modal.com/apps/bikram-iit-ai/main/ap-H0qO0WTFKd0WYcbo
 
 ---
 
+> **Historical (superseded):** the comparison below is the original Qwen2.5-3B-Instruct,
+> 4× A100 run against an earlier gateway — before the parallel dispatch and the
+> `max_completion_tokens` producer-cap fix, and before KV transfer moved to vLLM's
+> native NIXL push connector. It is kept for reference only; the current numbers are
+> the Qwen3-14B-FP8 2P+2D runs above.
+
 ## Results
 
 | Scenario | Metric | Nano-Dynamo | NVIDIA Dynamo | Gap (×) |
@@ -112,7 +118,7 @@ NVIDIA Dynamo run: https://modal.com/apps/bikram-iit-ai/main/ap-H0qO0WTFKd0WYcbo
 
 ---
 
-## Analysis
+## Analysis (historical — pre-fix gateway)
 
 ### TTFT gap (12–17×)
 
@@ -121,19 +127,17 @@ This is the dominant difference and is **architectural, not a bug**.
 - **Dynamo's frontend** is written in **Rust** — it handles HTTP parsing, worker selection, and response streaming in a few microseconds. The request path is:  
   `client → Rust HTTP server → route → vLLM worker (via NIXL) → stream back`.
 
-- **Nano-Dynamo's gateway** is a **Python FastAPI application** behind uvicorn. Each request goes through:  
+- **Nano-Dynamo's gateway** is a **Python FastAPI application** behind uvicorn. Each request went through:  
   `client → FastAPI → tokenize (transformers) → compute KV overlap (Python set intersection) → httpx proxy to prefill worker → await full prefill response → relay streamed decode output`.  
-  Every hop adds measurable overhead. For 20 concurrent requests the asyncio event loop becomes a bottleneck.
-
-The Python gateway alone accounts for ~800–1000 ms of TTFT per request (serialization, tokenization, proxy I/O).
+  Two factors drove the old gap: (1) this **serialized** dispatch, and (2) the producer request silently decoded the full OSL because vLLM prefers `max_completion_tokens` (which AIPerf sends) over `max_tokens`. Both are fixed — dispatch is parallel and the producer is capped at 1 token (`src/gateway.py` `_push`), moving KV transfer to ~200 ms and closing the gap to ~1.3×.
 
 ### Throughput gap (1.5–2.2×)
 
-Both systems use the **same vLLM backend** with identical configuration — the throughput difference comes from the gateway's inability to keep up with high request rates. At 20 concurrency, Dynamo's Rust frontend dispatches without contention, while Python's GIL and httpx connection pooling become limiting factors.
+Both systems use the **same vLLM backend** with identical configuration — the throughput difference comes from the gateway's inability to keep up with high request rates. At 20 concurrency, Dynamo's Rust frontend dispatches without contention, while Python's GIL and httpx connection pooling become limiting factors. (Historical: current runs are within 3–9%.)
 
 ### Latency gap (2×)
 
-Latency = TTFT + decode time. The decode phase is identical (same vLLM, same model), so the 2× gap is essentially TTFT overhead propagating through the total request duration.
+Latency = TTFT + decode time. The decode phase is identical (same vLLM, same model), so the old 2× gap was TTFT overhead propagating through the total request duration. (Historical: current runs are within 5%.)
 
 ### Goodput
 
@@ -141,7 +145,7 @@ Not measured in these scenarios (requires `--goodput` flag in AIPerf).
 
 ---
 
-## Honest Assessment
+## Honest Assessment (historical)
 
 | Aspect | Nano-Dynamo | NVIDIA Dynamo |
 |--------|-------------|---------------|
@@ -149,9 +153,9 @@ Not measured in these scenarios (requires `--goodput` flag in AIPerf).
 | **HTTP handling** | Python FastAPI + httpx | Custom Rust HTTP server |
 | **KV overlap computation** | Python set intersection on block hashes | Rust-native hash set operations |
 | **Concurrency** | Single asyncio event loop | Multi-threaded async Rust runtime |
-| **Python overhead** | ~800–1000 ms per request | < 1 ms per request |
+| **Python overhead** | ~800–1000 ms per request (pre-fix) | < 1 ms per request |
 
-Nano-Dynamo correctly implements all phases (disaggregated P/D split, KV-aware routing with overlap credit decay, KVBM block tracking, preemption, scaling) — but the **Python gateway is the bottleneck**. The routing decisions are correct; the delivery is slow.
+The routing decisions are correct; the remaining delivery gap is the Python gateway's ~70–80 ms per-request overhead versus Dynamo's Rust frontend (see the 2P+2D comparison above).
 
 A rewrite of the gateway in Rust (or even a Python optimization pass with `uvloop`, connection pooling, and zero-copy streaming) would substantially narrow the gap.
 
