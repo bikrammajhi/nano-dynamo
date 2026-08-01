@@ -142,6 +142,28 @@ Everything else — event transport, index performance, distributed consistency,
 
 If you want to understand the routing algorithm, read `gateway.py:92-240`. If you want to serve traffic, use real Dynamo.
 
+## Benchmark: Nano-Dynamo vs NVIDIA Dynamo
+
+![Head-to-head benchmark — 2P+2D, Qwen3-14B-FP8](docs/benchmark_2p2d_qwen3_14b.png)
+
+Regenerate with `python benchmark_charts.py` (data lives in `BENCHMARK_RESULTS.md`).
+
+### Settings (identical on both systems)
+
+| Setting | Value |
+|---------|-------|
+| Model | `Qwen/Qwen3-14B-FP8` |
+| Hardware | 4× A100 (2 prefill + 2 decode) on Modal, CUDA 12.1 |
+| Engine | vLLM 0.26 (`--enable-prefix-caching`) |
+| KV transfer | NIXL, push mode (`NixlPushConnector`), side channel over localhost |
+| KV config | `block_size=64`, `max_model_len=32768`, `gpu_memory_utilization=0.85` |
+| Frontend | Nano: Python FastAPI gateway on :8787 · Dynamo: Rust frontend on :8000 |
+| Load tool | AIPerf (OpenAI chat, streaming, `ignore_eos:true`) |
+| Scenario `multi_turn` | 30 conversations × 5 turns, ISL≈256, OSL≈128, concurrency 10 |
+| Scenario `mixed_workload` | 200 requests, mixed ISL/OSL (128/512/1024), concurrency 20 |
+
+Full numbers and run links: [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md).
+
 ## Running
 
 ```bash
