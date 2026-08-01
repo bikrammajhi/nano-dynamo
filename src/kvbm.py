@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import random
-import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -27,8 +26,6 @@ class BlockLocation:
     block_hash: int
     worker_id: int
     role: str
-    last_seen: float = 0.0
-    access_count: int = 0
 
 
 class BlockLocationRegistry:
@@ -38,18 +35,13 @@ class BlockLocationRegistry:
         self._locations: Dict[int, Dict[Tuple[int, str], BlockLocation]] = {}
 
     def record(self, block_hash: int, worker_id: int, role: str):
-        now = time.time()
         key = (worker_id, role)
         if block_hash not in self._locations:
             self._locations[block_hash] = {}
         if key not in self._locations[block_hash]:
             self._locations[block_hash][key] = BlockLocation(
                 block_hash=block_hash, worker_id=worker_id, role=role,
-                last_seen=now, access_count=0,
             )
-        loc = self._locations[block_hash][key]
-        loc.last_seen = now
-        loc.access_count += 1
 
     def worker_blocks(self, worker_id: int, role: str) -> Set[int]:
         blocks: Set[int] = set()

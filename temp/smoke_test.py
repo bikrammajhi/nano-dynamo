@@ -396,9 +396,9 @@ async def smoke_test():
             log.info("  PASS")
 
         log.info("=" * 60)
-        log.info("ALL 14 TESTS PASSED (2P + 2D, %s mode)", mode)
+        log.info("ALL 14 TESTS PASSED (2P + 2D, push mode)")
         log.info("=" * 60)
-        return {"status": "passed", "mode": mode}
+        return {"status": "passed", "mode": "push"}
 
     except Exception as e:
         log.error("TEST FAILED: %s", e)

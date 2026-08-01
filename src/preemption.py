@@ -31,7 +31,6 @@ log = logging.getLogger("nano-dynamo.preempt")
 @dataclass
 class SessionInfo:
     conv_id: str
-    token_ids: List[int]
     block_hashes: Set[int]
     p_idx: int
     d_idx: int
@@ -42,7 +41,6 @@ class SessionInfo:
 @dataclass
 class PreemptedRecord:
     conv_id: str
-    token_ids: List[int]
     block_hashes: Set[int]
     original_p_idx: int
     original_d_idx: int
@@ -76,13 +74,9 @@ class PreemptionManager:
         # Preempted sessions: conv_id -> PreemptedRecord
         self._preempted: Dict[str, PreemptedRecord] = {}
 
-        # Session block hashes for overlap checks (survives preemption)
-        self._session_hashes: Dict[str, Set[int]] = {}
-
     def register(
         self,
         conv_id: str,
-        token_ids: List[int],
         block_hashes: List[int],
         p_idx: int,
         d_idx: int,
@@ -91,12 +85,11 @@ class PreemptionManager:
         now = time.time()
         bh_set = set(block_hashes)
         info = SessionInfo(
-            conv_id=conv_id, token_ids=token_ids, block_hashes=bh_set,
+            conv_id=conv_id, block_hashes=bh_set,
             p_idx=p_idx, d_idx=d_idx, created_at=now, last_access=now,
         )
         self._sessions[conv_id] = info
         self._worker_sessions[d_idx][conv_id] = info
-        self._session_hashes[conv_id] = bh_set
 
     def access(self, conv_id: str):
         """Update last access time for LRU ordering."""
@@ -120,7 +113,6 @@ class PreemptionManager:
             now = time.time()
             record = PreemptedRecord(
                 conv_id=session.conv_id,
-                token_ids=session.token_ids,
                 block_hashes=session.block_hashes,
                 original_p_idx=session.p_idx,
                 original_d_idx=session.d_idx,
@@ -150,7 +142,6 @@ class PreemptionManager:
         if record is not None:
             log.info("PROMOTE conv=%s original_D=%d blocks=%d",
                      conv_id[:8], record.original_d_idx, len(record.block_hashes))
-            self._session_hashes.pop(conv_id, None)
         return record
 
     def preempted_count(self) -> int:

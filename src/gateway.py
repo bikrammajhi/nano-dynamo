@@ -10,7 +10,6 @@ PHASE 5: Dynamic Pool Scaling — worker drain, rebalance, auto-scale
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
 import random
@@ -19,7 +18,7 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import httpx
 import uvicorn
@@ -435,7 +434,7 @@ class DisaggProxy:
             self.migration.record_prefill_blocks(p_idx, hashes)
             self.migration.record_decode_blocks(d_idx, hashes)
             if conv_id:
-                self.preemptor.register(conv_id, token_ids, hashes, p_idx, d_idx)
+                self.preemptor.register(conv_id, hashes, p_idx, d_idx)
 
     async def _forward_stream(self, url: str, body: dict, headers: dict):
         """Eagerly POST upstream; returns an async generator of response chunks."""
