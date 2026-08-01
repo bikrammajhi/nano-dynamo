@@ -1,13 +1,13 @@
 # nano-dynamo
 
-An educational HTTP proxy that approximates NVIDIA Dynamo's KV-aware routing for disaggregated LLM inference. Useful for understanding the routing logic — **not for production**.
+A KV-aware routing proxy for disaggregated LLM inference — 1,273 lines of Python that runs within 1.35× of NVIDIA Dynamo's TTFT on the same hardware (same model, same load). Built to be read: Dynamo's full router is a compiled Rust service with CUDA kernels; this is the same cost function you can trace in an afternoon.
 
 > **Flex: the entire gateway is [1,273 lines of Python](src/gateway.py) — 5 files, no C++, no CUDA kernels — yet it lands within 1.35× of NVIDIA Dynamo's TTFT and within 3–9% on throughput/latency (see the benchmark below).**
 
 ## Benchmark: Nano-Dynamo vs NVIDIA Dynamo
 
-> **TL;DR — a 1,273-line Python gateway is now within 1.35× of NVIDIA Dynamo's TTFT
-> (12.7× before the fix), and within 3–9% on throughput and latency — same 4× A100s,
+> **TL;DR — a 1,273-line Python gateway is now within 1.35× of NVIDIA Dynamo's TTFT,
+> and within 3–9% on throughput and latency — same 4× A100s,
 > same model, same AIPerf load.** The routing logic is the interesting part:
 > [`src/gateway.py`](src/gateway.py) (cost function at `gateway.py:92-240`).
 
@@ -87,12 +87,13 @@ This is a learning tool built by reading Dynamo's public docs and source. It imp
 
 | File | Lines | What |
 |------|-------|------|
-| `src/gateway.py` | 727 | FastAPI proxy, policy, CLI |
-| `src/kvbm.py` | 189 | Block tracking + decode selection |
+| `src/gateway.py` | 726 | FastAPI proxy, policy, CLI |
+| `src/kvbm.py` | 181 | Block tracking + decode selection |
 | `src/kv_index.py` | 38 | Prefix overlap computation |
 | `src/kv_events.py` | 21 | Token-to-block-hash conversion |
-| `src/preemption.py` | 168 | Session promotion + eviction |
+| `src/preemption.py` | 159 | Session promotion + eviction |
 | `src/scaling.py` | 148 | Drain + auto-scale (stub) |
+| **Total** | **1,273** | |
 
 ## Cost function
 
