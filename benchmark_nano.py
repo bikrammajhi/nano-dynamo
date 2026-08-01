@@ -3,7 +3,7 @@ import asyncio, json, logging, os, subprocess, sys, threading, time
 from pathlib import Path
 import modal
 
-_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+_MODEL = "Qwen/Qwen3-14B-FP8"
 _BLOCK_SIZE = 64
 _MAX_MODEL_LEN = 32768
 INPUT_TOKENS = 256
@@ -14,7 +14,7 @@ _REPO_ROOT = Path(__file__).resolve().parent
 image = (
     modal.Image.from_registry("nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04", add_python="3.12")
     .apt_install("git", "wget", "curl", "build-essential")
-    .uv_pip_install("vllm>=0.7.2", pre="--prerelease=allow")
+    .uv_pip_install("vllm", pre="--prerelease=allow")
     .pip_install(
         "nixl", "xxhash", "transformers>=4.40", "huggingface-hub",
         "httpx", "fastapi", "uvicorn", "sse-starlette", "aiperf",
@@ -124,6 +124,8 @@ async def run_benchmark(scenario: str = "all", num_prefill: int = 2, num_decode:
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
             env["UCX_NET_DEVICES"] = "all"
+            env["NIXL_LOG_LEVEL"] = "TRACE"
+            env["VLLM_LOG_LEVEL"] = "INFO"
             env["VLLM_NIXL_SIDE_CHANNEL_HOST"] = "127.0.0.1"
             env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(5600 + i)
             kv_config = json.dumps({
@@ -136,7 +138,7 @@ async def run_benchmark(scenario: str = "all", num_prefill: int = 2, num_decode:
                 f"{sys.executable} -m vllm.entrypoints.openai.api_server "
                 f"--model {_MODEL} --port {port} --gpu-memory-utilization 0.85 "
                 f"--max-model-len {_MAX_MODEL_LEN} --block-size {_BLOCK_SIZE} "
-                f"--dtype auto "
+                f"--dtype auto --enable-prefix-caching "
                 f"--kv-transfer-config '{kv_config}'"
             )
             log.info("Starting PREFILL %d on GPU %d, port %d", i + 1, gpu_id, port)
@@ -147,6 +149,8 @@ async def run_benchmark(scenario: str = "all", num_prefill: int = 2, num_decode:
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
             env["UCX_NET_DEVICES"] = "all"
+            env["NIXL_LOG_LEVEL"] = "TRACE"
+            env["VLLM_LOG_LEVEL"] = "INFO"
             env["VLLM_NIXL_SIDE_CHANNEL_HOST"] = "127.0.0.1"
             env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(5700 + i)
             kv_config = json.dumps({
@@ -158,7 +162,7 @@ async def run_benchmark(scenario: str = "all", num_prefill: int = 2, num_decode:
                 f"{sys.executable} -m vllm.entrypoints.openai.api_server "
                 f"--model {_MODEL} --port {port} --gpu-memory-utilization 0.85 "
                 f"--max-model-len {_MAX_MODEL_LEN} --block-size {_BLOCK_SIZE} "
-                f"--dtype auto "
+                f"--dtype auto --enable-prefix-caching "
                 f"--kv-transfer-config '{kv_config}'"
             )
             log.info("Starting DECODE %d on GPU %d, port %d", i + 1, gpu_id, port)
@@ -179,7 +183,6 @@ async def run_benchmark(scenario: str = "all", num_prefill: int = 2, num_decode:
             f"--prefill-ports {prefill_ports_str} "
             f"--decode-ports {decode_ports_str} "
             f"--port {gateway_port} "
-            f"--mode {mode} "
             f"--prefill-kv-host 127.0.0.1 "
             f"--prefill-side-channel-ports {side_channel_ports}",
             "gateway", "/tmp/gateway.log"
@@ -215,9 +218,75 @@ async def run_benchmark(scenario: str = "all", num_prefill: int = 2, num_decode:
                     tp = result.get("output_token_throughput", {}).get("avg", 0)
                     lat = result.get("request_latency", {}).get("avg", 0)
                     gp = result.get("goodput", {}).get("avg", 0)
+                    pcts = {k: round(v, 1) for k, v in result.get("time_to_first_token", {}).items()
+                            if k in ("min", "p50", "p90", "p95", "p99", "max")}
                     log.info("  TTFT=%.0fms  tok/s=%.0f  lat=%.0fms  goodput=%.1f", ttft, tp, lat, gp)
+                    log.info("  TTFT percentiles: %s", pcts)
                 else:
                     all_results[name] = {}
+
+        # ── Diagnostics: where does TTFT go? (workers still live) ─────
+        log.info("=" * 60)
+        log.info("DIAGNOSTICS")
+        try:
+            prof = []
+            with open("/tmp/gateway.log") as f:
+                for line in f:
+                    if "PROF[" in line:
+                        parts = {}
+                        for tok in line.split("PROF[")[1].split("]")[1].split():
+                            if "=" in tok:
+                                k, v = tok.split("=", 1)
+                                try: parts[k] = float(v)
+                                except ValueError: pass
+                        if "p_done" in parts and "total_to_stream" in parts:
+                            prof.append(parts)
+            if prof:
+                n = len(prof)
+                def pct(xs, p): return xs[min(n - 1, int(n * p))]
+                pd = sorted(p["p_done"] for p in prof)
+                log.info("gateway PROF n=%d", n)
+                log.info("  prefill-side (p_done): p50=%.0f p95=%.0f max=%.0f ms", pct(pd, .5), pct(pd, .95), pd[-1])
+                for line in [l for l in open("/tmp/gateway.log") if "PROF[" in l][:3]:
+                    log.info("    %s", line.strip()[:220])
+        except FileNotFoundError:
+            log.warning("  no /tmp/gateway.log")
+
+        for wrole, wfile in [("prefill", "/tmp/vllm-prefill-0.log"), ("decode", "/tmp/vllm-decode-0.log")]:
+            try:
+                lines = open(wfile, errors="replace").read().splitlines()
+                log.info("worker[%s] log %d lines", wrole, len(lines))
+                for pat in ["NIXL", "xfer", "Transfer", "handshake", "Handshake", "slow NIXL"]:
+                    hits = [l for l in lines if pat in l]
+                    if hits:
+                        log.info("  %s: %d lines (sample):", pat, len(hits))
+                        for l in hits[:4]:
+                            log.info("    %s", l.strip()[:200])
+            except FileNotFoundError:
+                log.warning("  no %s", wfile)
+
+        import urllib.request
+        for role, port in [("prefill", prefill_ports[0]), ("decode", decode_ports[0])]:
+            try:
+                m = urllib.request.urlopen(f"http://localhost:{port}/metrics", timeout=10).read().decode()
+                want = {}
+                for line in m.splitlines():
+                    for key, label in [("vllm:time_to_first_token_seconds_sum", "ttft_sum"),
+                                       ("vllm:time_to_first_token_seconds_count", "ttft_cnt"),
+                                       ("vllm:e2e_request_latency_seconds_sum", "e2e_sum"),
+                                       ("vllm:e2e_request_latency_seconds_count", "e2e_cnt"),
+                                       ("vllm:prefix_cache_hits_total", "apc_hits"),
+                                       ("vllm:num_requests_total", "n_req")]:
+                        if line.startswith(key):
+                            want[label] = float(line.split()[-1])
+                if want.get("ttft_cnt", 0) > 0:
+                    log.info("engine[%s] TTFT avg=%.0fms  E2E avg=%.0fms  n=%d  prefix_cache_hits=%d",
+                             role,
+                             want["ttft_sum"] / want["ttft_cnt"] * 1000,
+                             want["e2e_sum"] / want["e2e_cnt"] * 1000,
+                             want["ttft_cnt"], want.get("apc_hits", 0))
+            except Exception as e:
+                log.warning("  metrics[%s] failed: %s", role, e)
 
     finally:
         kill_procs(procs)

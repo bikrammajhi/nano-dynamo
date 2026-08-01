@@ -1,6 +1,6 @@
 """Smoke test: 2P + 2D (4 GPUs), two-phase disaggregated proxy (vLLM >= 0.26.0).
 
-Tests both push and pull KV transfer modes with vLLM's native NixlConnector.
+Push-mode KV transfer only (NixlPushConnector).
 """
 from __future__ import annotations
 import asyncio, json, logging, os, subprocess, sys, threading, time
@@ -8,18 +8,17 @@ import httpx
 from pathlib import Path
 import modal
 
-_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+_MODEL = "Qwen/Qwen3-14B-FP8"
 _BLOCK_SIZE = 16
 _MAX_MODEL_LEN = 8192
 _REPO_ROOT = Path("/home/bikram_/workspace/nano-dynamo")
 _PORTS = dict(prefill=[8100, 8101], decode=[8200, 8201])
-_TRANSFER_MODE = os.environ.get("TRANSFER_MODE", "push")
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python="3.12")
     .apt_install("git", "wget", "curl", "build-essential")
     .pip_install(
-        "vllm>=0.26.0",
+        "vllm",
         "nixl", "xxhash", "transformers>=4.40", "huggingface-hub",
         "httpx", "fastapi", "uvicorn", "sse-starlette",
     )
@@ -62,11 +61,11 @@ def kill_procs(procs):
 
 @app.function(image=image, gpu="A100:4", timeout=3600, max_containers=1,
               secrets=[modal.Secret.from_name("huggingface-secret")])
-async def smoke_test(mode: str = _TRANSFER_MODE):
+async def smoke_test():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger("smoke")
     gateway_port = 8787
-    kv_connector = "NixlPushConnector" if mode == "push" else "NixlConnector"
+    kv_connector = "NixlPushConnector"
 
     hf_token = os.environ.get("HF_TOKEN")
     dl_cmd = (f"from huggingface_hub import snapshot_download; "
@@ -131,14 +130,13 @@ async def smoke_test(mode: str = _TRANSFER_MODE):
         log.info("All 4 vLLM workers ready")
 
         # Gateway (two-phase disaggregated proxy)
-        log.info("Starting two-phase proxy (%s mode, %s)", mode, kv_connector)
+        log.info("Starting two-phase proxy (%s)", kv_connector)
         gw_cmd = (
             f"{sys.executable} -m src.gateway "
             f"--model {_MODEL} "
             f"--prefill-ports {' '.join(str(p) for p in _PORTS['prefill'])} "
             f"--decode-ports {' '.join(str(p) for p in _PORTS['decode'])} "
             f"--port {gateway_port} "
-            f"--mode {mode} "
             f"--prefill-kv-host 127.0.0.1 "
             f"--prefill-side-channel-ports 5600 5601"
         )
@@ -238,28 +236,21 @@ async def smoke_test(mode: str = _TRANSFER_MODE):
         # ── Test 6: Proxy log analysis ──────────────────────────────────
         log.info("TEST 6: Proxy log analysis")
         lp = "/tmp/proxy.log"
-        pull_lines = 0
         push_lines = 0
         p0_routes = 0
         p1_routes = 0
         try:
             with open(lp) as f:
                 for line in f:
-                    if "PULL[" in line:
-                        pull_lines += 1
-                    elif "PUSH[" in line:
+                    if "PUSH[" in line:
                         push_lines += 1
                         if ":8100" in line:
                             p0_routes += 1
                         elif ":8101" in line:
                             p1_routes += 1
-            log.info("  %s mode: %d PULL lines, %d PUSH lines",
-                     mode, pull_lines, push_lines)
+            log.info("  push mode: %d PUSH lines", push_lines)
             log.info("  Prefill distribution: P0=%d P1=%d", p0_routes, p1_routes)
-            if mode == "pull":
-                log.info("  ✓ Pull-mode routing verified (%d routes)", pull_lines)
-            else:
-                log.info("  ✓ Push-mode routing verified (%d routes)", push_lines)
+            log.info("  ✓ Push-mode routing verified (%d routes)", push_lines)
         except FileNotFoundError:
             log.warning("  Proxy log not found at %s", lp)
 
@@ -426,7 +417,6 @@ async def smoke_test(mode: str = _TRANSFER_MODE):
 
 @app.local_entrypoint()
 def main():
-    mode = os.environ.get("TRANSFER_MODE", "push")
-    print(f"Running smoke test (2P + 2D on 4 GPUs, mode={mode})...")
-    result = smoke_test.remote(mode)
+    print("Running smoke test (2P + 2D on 4 GPUs, push mode)...")
+    result = smoke_test.remote()
     print(f"Result: {result}")

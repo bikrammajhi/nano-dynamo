@@ -12,6 +12,43 @@ All GPU, engine, and model parameters are matched exactly — the only variable 
 
 ---
 
+## Latest: Push-mode 1P+1D — Qwen3-14B-FP8 (2026-08-01)
+
+**Harness**: `benchmark_nano.py` · **Hardware**: 2× A100 (1 prefill + 1 decode) on Modal ·  
+**Engine**: vLLM 0.26, `NixlPushConnector` (KV push, `block_size=64`, `max_model_len=32768`) ·  
+**Workload**: `multi_turn` (30 convs × 5 turns, ISL=271, OSL=128, concurrency 10)
+
+After fixing the producer-side `max_tokens` cap (see root cause below), 1P1D push mode now delivers:
+
+| Metric | Before fix | After fix | Δ |
+|--------|-----------:|----------:|--:|
+| TTFT (ms, avg) | 2,676 | **352** | 7.6× |
+| TTFT (ms, p50) | 2,677 | **233** | 11.5× |
+| TTFT (ms, p99) | 2,983 | **838** | 3.6× |
+| Throughput (tok/s) | 213 | **353** | 1.66× |
+| Request Latency (ms) | 4,614 | **2,236** | 2.1× |
+
+Engine-level breakdown (after fix, n=175):
+
+| Engine | TTFT avg (ms) | E2E avg (ms) | Note |
+|--------|--------------:|-------------:|------|
+| prefill | 214 | 214 | prefill + 1 token, finishes in one step |
+| decode | 325 | 2,208 | KV arrives ~224 ms, then full 128-token decode |
+
+KV transfer: ~10 ms avg xfer (P90 ~16 ms) at ~3.1 transfers/s.
+
+**Root cause of the pre-fix TTFT**: aiperf sends `max_completion_tokens: 128` (from
+`--output-tokens-mean`), and vLLM's OpenAI server prefers `max_completion_tokens` over
+`max_tokens` (`vllm/entrypoints/openai/chat_completion/serving.py`). The gateway's
+`p_body["max_tokens"] = 1` override was silently ignored, so the producer decoded the full
+128-token response (~2.5 s) before finishing — only then did the KV transfer start. The
+gateway now caps **both** fields on the producer body (`src/gateway.py` `_push`), so the
+producer stops after 1 token and the transfer overlaps with the decode serving.
+
+Run: https://modal.com/apps/bikram-iit-ai/main/ap-xvaegRsT3ZzZtcWTSUfohF
+
+---
+
 ## Results
 
 | Scenario | Metric | Nano-Dynamo | NVIDIA Dynamo | Gap (×) |

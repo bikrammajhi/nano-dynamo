@@ -48,7 +48,7 @@ This is a learning tool built by reading Dynamo's public docs and source. It imp
 
 | Phase | What | Status |
 |-------|------|--------|
-| 1 | Disaggregated proxy (HTTP push/pull to prefill + decode) | Done |
+| 1 | Disaggregated proxy (HTTP push to prefill + decode) | Done |
 | 2 | KV-aware routing with Dynamo cost function | Done |
 | 3 | KV Block Migration (block tracking + decode selection) | Done |
 | 4 | Preemption & promotion (LRU eviction) | Done |
@@ -149,7 +149,7 @@ If you want to understand the routing algorithm, read `gateway.py:92-240`. If yo
 python -m src.gateway \
   --prefill-ports 8100 \
   --decode-ports 8200 \
-  --model Qwen/Qwen2.5-3B-Instruct \
+  --model Qwen/Qwen3-14B-FP8 \
   --overlap-score-credit 1.0 \
   --prefill-load-scale 1.0 \
   --router-temperature 0.0

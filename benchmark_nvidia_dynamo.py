@@ -3,7 +3,7 @@ import asyncio, json, logging, os, subprocess, sys, threading, time
 from pathlib import Path
 import modal
 
-_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+_MODEL = "Qwen/Qwen3-14B-FP8"
 _BLOCK_SIZE = 64
 _MAX_MODEL_LEN = 32768
 _NUM_PREFILL = 2
@@ -14,7 +14,7 @@ FRONTEND_PORT = 8000
 image = (
     modal.Image.from_registry("nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04", add_python="3.12")
     .apt_install("git", "wget", "curl", "build-essential")
-    .uv_pip_install("vllm>=0.7.2", pre="--prerelease=allow")
+    .uv_pip_install("vllm", pre="--prerelease=allow")
     .uv_pip_install("ai-dynamo[vllm]", pre="--prerelease=allow")
     .pip_install("nixl", "xxhash", "transformers>=4.40", "huggingface-hub", "httpx", "fastapi", "uvicorn", "sse-starlette", "aiperf")
 )
@@ -182,6 +182,15 @@ async def run_benchmark(scenario: str = "all"):
 
             log.info("Waiting for Dynamo workers...")
             if not wait_for_models(FRONTEND_PORT, timeout=300):
+                log.error("Workers failed to register — dumping worker log tails:")
+                for lg in d_logs:
+                    try:
+                        tail = subprocess.run(
+                            ["tail", "-n", "40", lg], capture_output=True, text=True
+                        ).stdout
+                        log.error("----- %s -----\n%s", lg, tail)
+                    except Exception:
+                        pass
                 raise RuntimeError("Dynamo workers failed to register")
             log.info("Dynamo ready — running AIPerf")
 

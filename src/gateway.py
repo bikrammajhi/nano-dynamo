@@ -1,3 +1,4 @@
+
 """Nano-Dynamo: two-phase disaggregated proxy with KV-aware routing.
 
 PHASE 1: Disaggregated Prefill/Decode — route to independent P/D GPU pools.
@@ -14,6 +15,7 @@ import logging
 import math
 import random
 import threading
+import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -247,7 +249,6 @@ class DisaggProxy:
         prefill_instances: list[str],
         decode_instances: list[str],
         model: str,
-        mode: str = "push",
         prefill_engine_ids: Optional[list[str]] = None,
         prefill_kv_host: str = "127.0.0.1",
         prefill_side_channel_ports: Optional[list[int]] = None,
@@ -268,7 +269,6 @@ class DisaggProxy:
         self.prefill_instances = prefill_instances
         self.decode_instances = decode_instances
         self.model = model
-        self.mode = mode
         self.block_size = block_size
         self.policy = policy or KvAwarePolicy(
             overlap_score_credit=overlap_score_credit,
@@ -308,8 +308,8 @@ class DisaggProxy:
         self._conv_worker: Dict[str, tuple] = {}
 
         log.info(
-            "DisaggProxy mode=%s model=%s P=%d D=%d policy=%s",
-            mode, model, len(prefill_instances), len(decode_instances),
+            "DisaggProxy model=%s P=%d D=%d policy=%s",
+            model, len(prefill_instances), len(decode_instances),
             type(policy).__name__,
         )
 
@@ -408,7 +408,7 @@ class DisaggProxy:
             idx = p_valid[0]
 
         # Phase 3+5: KVBM decode selection — use overlap_score_credit=0
-        # because KV is being transferred (push/pull) so cache overlap on
+        # because KV is being transferred (push) so cache overlap on
         # decode workers should not be credited (Dynamo behavior).
         d_idx, d_overlap = self.migration.best_decode(
             block_hashes, valid_only=d_valid, overlap_credit=0.0,
@@ -437,20 +437,28 @@ class DisaggProxy:
             if conv_id:
                 self.preemptor.register(conv_id, token_ids, hashes, p_idx, d_idx)
 
-    async def _forward_stream(self, url: str, body: dict, headers: dict) -> AsyncGenerator[bytes, None]:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as c:
-            async with c.stream("POST", url, json=body, headers=headers) as resp:
-                if resp.status_code != 200:
-                    err = await resp.aread()
-                    raise RuntimeError(
-                        f"Upstream {url} returned {resp.status_code}: {err[:200].decode(errors='replace')}"
-                    )
+    async def _forward_stream(self, url: str, body: dict, headers: dict):
+        """Eagerly POST upstream; returns an async generator of response chunks."""
+        client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+        stream_ctx = client.stream("POST", url, json=body, headers=headers)
+        resp = await stream_ctx.__aenter__()
+        if resp.status_code != 200:
+            err = await resp.aread()
+            await stream_ctx.__aexit__(None, None, None)
+            await client.aclose()
+            raise RuntimeError(
+                f"Upstream {url} returned {resp.status_code}: {err[:200].decode(errors='replace')}"
+            )
+
+        async def gen():
+            try:
                 async for chunk in resp.aiter_bytes():
                     yield chunk
+            finally:
+                await stream_ctx.__aexit__(None, None, None)
+                await client.aclose()
 
-    async def _forward_once(self, url: str, body: dict, headers: dict) -> httpx.Response:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as c:
-            return await c.post(url, json=body, headers=headers)
+        return gen()
 
     async def _drain(self, url: str, body: dict, headers: dict):
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as c:
@@ -459,13 +467,21 @@ class DisaggProxy:
                     pass
 
     async def _push(self, raw_request: Request):
+        t_req = time.monotonic()
         body = await raw_request.json()
         req_id = str(uuid.uuid4())
         p_url, d_url, idx, eid, sport, d_idx = self._pick(body)
+        t_pick = time.monotonic()
         headers = {"X-Request-Id": req_id}
 
         p_body = body.copy()
+        # Cap the producer's generation at 1 token. vLLM's OpenAI server
+        # prefers max_completion_tokens (aiperf sends it), so set BOTH fields;
+        # setting only max_tokens is silently ignored when the client supplies
+        # max_completion_tokens, leaving the producer to decode the full
+        # response and delay the KV transfer by the whole decode time.
         p_body["max_tokens"] = 1
+        p_body["max_completion_tokens"] = 1
         p_body["kv_transfer_params"] = {
             "do_remote_decode": True,
             "do_remote_prefill": False,
@@ -493,71 +509,43 @@ class DisaggProxy:
         p_task = asyncio.create_task(
             self._drain(f"http://{p_url}/v1/chat/completions", p_body, headers)
         )
+        t_p_dispatch = time.monotonic()
 
+        # Dispatch the decode request IN PARALLEL with the prefill: the
+        # decode-side PUSH_REG is what lets the prefill engine start its KV
+        # transfer, and the prefill response is only emitted once the transfer
+        # completes. Serializing (awaiting p_task first) holds every request
+        # ~2s under load. The prefill completion is accounted in the
+        # background; the client stream only needs the decode worker.
         try:
-            d_stream = self._forward_stream(f"http://{d_url}/v1/chat/completions", d_body, headers)
+            d_stream = await self._forward_stream(
+                f"http://{d_url}/v1/chat/completions", d_body, headers
+            )
         except RuntimeError as e:
             p_task.cancel()
             self.migration.release_prefill_load(idx, len(token_ids))
             log.error("Decode-side failure for PUSH[%s]: %s", req_id[:8], e)
             return JSONResponse(status_code=502, content={"error": str(e)})
 
-        await p_task
-        self.migration.release_prefill_load(idx, len(token_ids))
-        self._record_blocks(idx, d_idx, token_ids, body.get("conversation_id"))
-
-        return StreamingResponse(d_stream, media_type="text/event-stream")
-
-    async def _pull(self, raw_request: Request):
-        body = await raw_request.json()
-        req_id = str(uuid.uuid4())
-        p_url, d_url, idx, eid, sport, d_idx = self._pick(body)
-        headers = {"X-Request-Id": req_id}
-
-        p_body = body.copy()
-        p_body["max_tokens"] = 1
-        p_body["kv_transfer_params"] = {
-            "do_remote_decode": True,
-            "do_remote_prefill": False,
-            "remote_engine_id": None,
-            "remote_block_ids": None,
-            "remote_host": None,
-            "remote_port": None,
-        }
-
-        log.info("PULL[%s] P=%s D=%s", req_id[:8], p_url, d_url)
-
-        resp = await self._forward_once(f"http://{p_url}/v1/chat/completions", p_body, headers)
-        if resp.status_code != 200:
+        async def _finish_push():
+            try:
+                await p_task
+            except Exception as e:
+                log.error("PUSH[%s] prefill drain failed: %s", req_id[:8], e)
             self.migration.release_prefill_load(idx, len(token_ids))
-            return JSONResponse(status_code=resp.status_code, content={"error": resp.text[:200]})
-        result = resp.json()
+            self._record_blocks(idx, d_idx, token_ids, body.get("conversation_id"))
+            log.info(
+                "PROF[%s] mode=push tokenize=%.1f p_dispatch=%.1f p_done=%.1f "
+                "total_to_stream=%.1f isl=%d",
+                req_id[:8],
+                (t_pick - t_req) * 1000,
+                (t_p_dispatch - t_req) * 1000,
+                (time.monotonic() - t_req) * 1000,
+                (time.monotonic() - t_req) * 1000,
+                len(token_ids),
+            )
 
-        token_ids = self._tokenize(body)
-        self.migration.release_prefill_load(idx, len(token_ids))
-        self._record_blocks(idx, d_idx, token_ids, body.get("conversation_id"))
-
-        kv_params = result.get("kv_transfer_params") or {}
-        d_body = body.copy()
-        d_body["kv_transfer_params"] = {
-            "do_remote_decode": False,
-            "do_remote_prefill": True,
-            "remote_engine_id": kv_params.get("remote_engine_id") or eid,
-            "remote_host": kv_params.get("remote_host") or self.p_kv_host,
-            "remote_port": kv_params.get("remote_port") or sport,
-            "remote_block_ids": kv_params.get("remote_block_ids"),
-            "tp_size": kv_params.get("tp_size", self.p_tp_size),
-            "pp_size": kv_params.get("pp_size", self.p_pp_size),
-            "remote_request_id": req_id,
-        }
-        d_body.setdefault("max_tokens", body.get("max_tokens", 1024))
-
-        try:
-            d_stream = self._forward_stream(f"http://{d_url}/v1/chat/completions", d_body, headers)
-        except RuntimeError as e:
-            log.error("Decode-side failure for PULL[%s]: %s", req_id[:8], e)
-            return JSONResponse(status_code=502, content={"error": str(e)})
-
+        asyncio.create_task(_finish_push())
         return StreamingResponse(d_stream, media_type="text/event-stream")
 
 
@@ -580,20 +568,15 @@ def create_app(**kwargs) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(raw_request: Request):
-        if proxy.mode == "pull":
-            return await proxy._pull(raw_request)
         return await proxy._push(raw_request)
 
     @app.post("/v1/completions")
     async def completions(raw_request: Request):
-        if proxy.mode == "pull":
-            return await proxy._pull(raw_request)
         return await proxy._push(raw_request)
 
     @app.get("/status")
     async def status():
         return {
-            "mode": proxy.mode,
             "model": proxy.model,
             "prefill_instances": proxy.prefill_instances,
             "decode_instances": proxy.decode_instances,
@@ -700,7 +683,6 @@ if __name__ == "__main__":
     parser.add_argument("--decode-ports", type=int, nargs="+", default=[8200])
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--mode", type=str, default="push", choices=["push", "pull"])
     parser.add_argument("--prefill-kv-host", type=str, default="127.0.0.1")
     parser.add_argument("--prefill-side-channel-ports", type=int, nargs="*", default=None)
     parser.add_argument("--prefill-tp-size", type=int, default=1)
@@ -725,7 +707,6 @@ if __name__ == "__main__":
             prefill_instances=prefill_hosts,
             decode_instances=decode_hosts,
             model=args.model,
-            mode=args.mode,
             prefill_kv_host=args.prefill_kv_host,
             prefill_side_channel_ports=args.prefill_side_channel_ports,
             prefill_tp_size=args.prefill_tp_size,
