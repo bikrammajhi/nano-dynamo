@@ -1,10 +1,12 @@
 # nano-dynamo
 
-An educational HTTP proxy (~1300 lines of Python) that approximates NVIDIA Dynamo's KV-aware routing for disaggregated LLM inference. Useful for understanding the routing logic — **not for production**.
+An educational HTTP proxy that approximates NVIDIA Dynamo's KV-aware routing for disaggregated LLM inference. Useful for understanding the routing logic — **not for production**.
+
+> **Flex: the entire gateway is [1,273 lines of Python](src/gateway.py) — 5 files, no C++, no CUDA kernels — yet it lands within 1.35× of NVIDIA Dynamo's TTFT and within 3–9% on throughput/latency (see the benchmark below).**
 
 ## Benchmark: Nano-Dynamo vs NVIDIA Dynamo
 
-> **TL;DR — a ~1000-line Python gateway is now within 1.35× of NVIDIA Dynamo's TTFT
+> **TL;DR — a 1,273-line Python gateway is now within 1.35× of NVIDIA Dynamo's TTFT
 > (12.7× before the fix), and within 3–9% on throughput and latency — same 4× A100s,
 > same model, same AIPerf load.** The routing logic is the interesting part:
 > [`src/gateway.py`](src/gateway.py) (cost function at `gateway.py:92-240`).
@@ -31,7 +33,7 @@ Full numbers and run links: [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md).
 
 ## Project status
 
-This is a learning tool built by reading Dynamo's public docs and source. It implements the same **cost function formula** but is radically simpler in every dimension. You can read all the code in an hour.
+This is a learning tool built by reading Dynamo's public docs and source. It implements the same **cost function formula** but is radically simpler in every dimension — [1,273 lines of Python across 5 files](src/), no C++, no CUDA kernels, no Rust. You can read all the code in an hour.
 
 ## Architecture
 
