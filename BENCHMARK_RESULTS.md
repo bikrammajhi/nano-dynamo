@@ -76,6 +76,29 @@ Run: https://modal.com/apps/bikram-iit-ai/main/ap-N9xMXGs0PUWfc3aQokfibz
 
 ---
 
+## Head-to-head: Nano-Dynamo vs NVIDIA Dynamo, 2P+2D — Qwen3-14B-FP8 (2026-08-01)
+
+Both systems ran the identical AIPerf scenarios on 4× A100 (2 prefill + 2 decode), same model
+and engine parameters — the only variable is the routing/frontend layer.
+
+| Scenario | Metric | Nano-Dynamo | NVIDIA Dynamo | Gap (×) | Gap before fix (×) |
+|----------|--------|------------:|--------------:|--------:|--------------------:|
+| **multi_turn** | TTFT (ms) | 264 | 195 | **1.35×** | 12.7× |
+| (30 convs × 5 turns) | Throughput (tok/s) | 371 | 405 | 1.09× | 1.5× |
+| | Request Latency (ms) | 2,083 | 1,992 | 1.05× | 2.0× |
+| **mixed_workload** | TTFT (ms) | 326 | 247 | **1.32×** | 17.2× |
+| (200 reqs, mixed ISL/OSL) | Throughput (tok/s) | 1,121 | 1,155 | 1.03× | 2.2× |
+| | Request Latency (ms) | 3,085 | 2,984 | 1.03× | 2.2× |
+
+The TTFT gap collapsed from **12–17× to ~1.3×**; throughput and latency are now within
+**3–9%** of NVIDIA Dynamo. The remaining delta is the Python gateway's per-request
+overhead (~70–80 ms) against Dynamo's Rust frontend.
+
+Nano-Dynamo runs: https://modal.com/apps/bikram-iit-ai/main/ap-N9xMXGs0PUWfc3aQokfibz  
+NVIDIA Dynamo run: https://modal.com/apps/bikram-iit-ai/main/ap-H0qO0WTFKd0WYcbosrLHes
+
+---
+
 ## Results
 
 | Scenario | Metric | Nano-Dynamo | NVIDIA Dynamo | Gap (×) |
