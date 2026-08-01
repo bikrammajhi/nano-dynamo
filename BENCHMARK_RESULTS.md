@@ -49,6 +49,33 @@ Run: https://modal.com/apps/bikram-iit-ai/main/ap-xvaegRsT3ZzZtcWTSUfohF
 
 ---
 
+## Full benchmark: Push-mode 2P+2D — Qwen3-14B-FP8 (2026-08-01)
+
+**Harness**: `benchmark_nano.py` · **Hardware**: 4× A100 (2 prefill + 2 decode) on Modal ·  
+**Engine**: vLLM 0.26, `NixlPushConnector` (KV push, `block_size=64`, `max_model_len=32768`) ·  
+**Scenarios**: `multi_turn` (30 convs × 5 turns, ISL=271, OSL=128, concurrency 10) and
+`mixed_workload` (200 reqs, mixed ISL/OSL, concurrency 20)
+
+Same producer-cap fix, full 4-GPU stack:
+
+| Scenario | TTFT (ms) | TTFT p50 (ms) | TTFT p99 (ms) | Throughput (tok/s) | Latency (ms) |
+|----------|----------:|--------------:|--------------:|-------------------:|-------------:|
+| multi_turn | 264 | 218 | 638 | 371 | 2,083 |
+| mixed_workload | 326 | 224 | 1,506 | 1,121 | 3,085 |
+
+Engine-level breakdown (n≈200 across both scenarios):
+
+| Engine | TTFT avg (ms) | E2E avg (ms) | Note |
+|--------|--------------:|-------------:|------|
+| prefill | 196 | 196 | prefill + 1 token, finishes in one step |
+| decode | 273 | 2,580 | KV arrives ~200 ms, then full OSL decode |
+
+KV transfer: 5–31 ms avg xfer under load, ~1.6–1.9 transfers/s per prefill worker.
+
+Run: https://modal.com/apps/bikram-iit-ai/main/ap-N9xMXGs0PUWfc3aQokfibz
+
+---
+
 ## Results
 
 | Scenario | Metric | Nano-Dynamo | NVIDIA Dynamo | Gap (×) |
