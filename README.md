@@ -152,7 +152,7 @@ Dynamo can run `dynamo.indexer` as an independent service. nano-dynamo's index i
 Dynamo's KV Block Manager offloads to CPU → SSD → S3/Azure. nano-dynamo's "KVBM" is just block-location tracking + admission control.
 
 ### SLA planner
-Dynamo has a formal SLA-based auto-scaler. nano-dynamo's ScalingManager is a 15-second stub loop.
+Dynamo has a formal SLA-based auto-scaler. nano-dynamo's ScalingManager is an advisory stub — it emits rebalance recommendations every 10 s (`src/scaling.py`) and an external orchestrator would have to act on them.
 
 ### Kubernetes-native deployment
 Dynamo has CRDs, shadow-engine failover, topology-aware KV transfer. nano-dynamo is `uvicorn.run(...)`.
