@@ -97,6 +97,35 @@ overhead (~70–80 ms) against Dynamo's Rust frontend.
 Nano-Dynamo runs: https://modal.com/apps/bikram-iit-ai/main/ap-N9xMXGs0PUWfc3aQokfibz  
 NVIDIA Dynamo run: https://modal.com/apps/bikram-iit-ai/main/ap-H0qO0WTFKd0WYcbosrLHes
 
+### What this benchmark does NOT measure (known limits)
+
+This setup is a clean measurement of the **frontend's per-request overhead** — same
+harness, same model, same load on both systems — but it is a weak probe of the
+**routing logic**, which is the thing nano-dynamo actually implements:
+
+1. **Two prefill workers = a binary choice.** With 2P the KV-aware cost function
+   cannot demonstrate value; round-robin would score identically. Dynamo's routing
+   matters at 8+ workers, so this benchmark cannot distinguish a good router from a
+   random one.
+2. **No prefix-cache pressure.** 30 conversations × 5 turns with a shared system
+   prompt keeps overlap trivially high (both workers hold the same blocks). The
+   overlap-credit / decay logic — the actual Dynamo cost formula — is never
+   stress-tested.
+3. **Intra-node NVLink transfer (5–31 ms).** The hard part of disaggregated
+   inference — scale-out KV transfer over a contended fabric (RDMA/GDR) — is not
+   measured. The 12.7×→1.35× collapse partly reflects measuring in this easy regime.
+4. **14B FP8 is below the disaggregation sweet spot** (70B+), where prefill and
+   decode have genuinely different bottlenecks and the P/D split earns its cost.
+   At this model size a single engine could serve both phases.
+5. **Load too light for Phase 4/5.** Concurrency 10–20 never approaches the
+   decode cache capacity, so preemption (LRU eviction, promotion) and auto-scaling
+   are never exercised under pressure.
+
+**Plan:** these are the limits to fix, one by one — scale to 4P+4D/8P+8D, 100+
+conversations with shared prefixes, 70B-class model, longer OSL, multi-node
+transfer. Each re-benchmark updates this section only; the historical results
+below stay frozen.
+
 ---
 
 > **Historical (superseded):** the comparison below is the original Qwen2.5-3B-Instruct,
