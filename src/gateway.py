@@ -316,7 +316,14 @@ class DisaggProxy:
         messages = body.get("messages", [])
         prompt = body.get("prompt", "")
         if messages:
-            text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            template = self.tokenizer.chat_template
+            if template is None:
+                text = "\n".join(
+                    f"{m.get('role', 'user')}: {m.get('content', '')}"
+                    for m in messages
+                )
+            else:
+                text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         else:
             text = prompt
         return self.tokenizer.encode(text) if text else []
