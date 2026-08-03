@@ -45,8 +45,6 @@ KV transfer: ~10 ms avg xfer (P90 ~16 ms) at ~3.1 transfers/s.
 gateway now caps **both** fields on the producer body (`src/gateway.py` `_push`), so the
 producer stops after 1 token and the transfer overlaps with the decode serving.
 
-Run: https://modal.com/apps/bikram-iit-ai/main/ap-xvaegRsT3ZzZtcWTSUfohF
-
 ---
 
 ## Full benchmark: Push-mode 2P+2D — Qwen3-14B-FP8 (2026-08-01)
@@ -72,8 +70,6 @@ Engine-level breakdown (n≈200 across both scenarios):
 
 KV transfer: 5–31 ms avg xfer under load, ~1.6–1.9 transfers/s per prefill worker.
 
-Run: https://modal.com/apps/bikram-iit-ai/main/ap-N9xMXGs0PUWfc3aQokfibz
-
 ---
 
 ## Head-to-head: Nano-Dynamo vs NVIDIA Dynamo, 2P+2D — Qwen3-14B-FP8 (2026-08-01)
@@ -93,9 +89,6 @@ and engine parameters — the only variable is the routing/frontend layer.
 The TTFT gap collapsed from **12–17× to ~1.3×**; throughput and latency are now within
 **3–9%** of NVIDIA Dynamo. The remaining delta is the Python gateway's per-request
 overhead (~70–80 ms) against Dynamo's Rust frontend.
-
-Nano-Dynamo runs: https://modal.com/apps/bikram-iit-ai/main/ap-N9xMXGs0PUWfc3aQokfibz  
-NVIDIA Dynamo run: https://modal.com/apps/bikram-iit-ai/main/ap-H0qO0WTFKd0WYcbosrLHes
 
 ### What this benchmark does NOT measure (known limits)
 
@@ -199,7 +192,3 @@ modal run benchmark_nano.py --scenario all
 # NVIDIA Dynamo
 modal run benchmark_nvidia_dynamo.py --scenario all
 ```
-
-Both benchmarks run on 4× A100 GPUs on Modal. Results are recorded at:
-- https://modal.com/apps/bikram-iit-ai/main/deployed/nano-benchmark
-- https://modal.com/apps/bikram-iit-ai/main/deployed/dynamo-benchmark
