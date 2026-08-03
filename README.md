@@ -28,10 +28,6 @@ Regenerate with `python benchmark_charts.py` (data lives in `BENCHMARK_RESULTS.m
 
 Full numbers and run links: [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md).
 
-## Project status
-
-This is a learning tool built by reading Dynamo's public docs and source. It implements the same **cost function formula** but is radically simpler in every dimension — [1,273 lines of Python across 5 files](src/), no C++, no CUDA kernels, no Rust. You can read all the code in an hour.
-
 ## Architecture
 
 ```
