@@ -2,7 +2,7 @@
 
 A KV-aware routing proxy for disaggregated LLM inference, written to be read: where NVIDIA Dynamo ships a compiled Rust router backed by CUDA kernels, this implements the same cost function in plain Python. The routing logic is the interesting part — [`src/gateway.py`](src/gateway.py), cost function at `gateway.py:92-240`.
 
-> **Flex: the entire gateway is [1,273 lines of Python](src/gateway.py) — 5 files, no C++, no CUDA kernels, no Rust. You can read all of it in an hour.**
+> **Flex: the entire gateway is [1,298 lines of Python](src/) — 6 files, no C++, no CUDA kernels, no Rust. You can read all of it in an hour.**
 
 ## Benchmark: Nano-Dynamo vs NVIDIA Dynamo
 
@@ -28,71 +28,54 @@ Regenerate with `python benchmark_charts.py` (data lives in `BENCHMARK_RESULTS.m
 
 Full numbers and run links: [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md).
 
-## Project status
-
-This is a learning tool built by reading Dynamo's public docs and source. It implements the same **cost function formula** but is radically simpler in every dimension — [1,273 lines of Python across 5 files](src/), no C++, no CUDA kernels, no Rust. You can read all the code in an hour.
-
 ## Architecture
 
+A single-process FastAPI gateway that sits in front of separately-deployed prefill and decode vLLM engines and implements Dynamo's KV-aware routing in Python.
+
 ```
-                         ┌──────────────────────────────────────────────────┐
-                         │              nano-dynamo gateway                │
-                         │                                                  │
-    POST /v1/chat/completions                                              │
-         │                                                                │
-         ▼                                                                │
-     ┌──────────┐    ┌────────────────────────────────────┐              │
-     │  _pick() │───►│  Phase 2: KvAwarePolicy.select()   │              │
-     │          │    │                                    │              │
-     │ tokenize │    │  cost = prefill_cost               │              │
-     │ overlap  │    │       + decode_cost                │              │
-     │ load     │    │       + active_request_weight       │              │
-     │          │    │                                    │              │
-     │          │    │  argmin / softmin                  │              │
-     └──────────┘    └────────────────────────────────────┘              │
-         │                         │                                      │
-         │                   Phase 3: KVBM best_decode()                  │
-         │                         │                                      │
-         ▼                         ▼                                      │
-    ┌────────────────────────────────────────────────────────────┐        │
-    │  Prefill vLLM (HTTP)            Decode vLLM (HTTP)         │        │
-    │  Runs prefill, capped at        Waits for remote KV, then  │        │
-    │  1 token (max_tokens=1)         generates the full         │        │
-    │                                response (OSL tokens)       │        │
-    └────────────────────────────────────────────────────────────┘        │
-         ▲                         ▲                                      │
-         │   KV blocks pushed      │                                      │
-         │   GPU-direct via NIXL   │                                      │
-         └─────────────────────────┘                                      │
-                         ┌──────────────────────────────────────┐         │
-                         │  Phase 4: PreemptionManager          │         │
-                         │  Phase 5: ScalingManager (stub)      │         │
-                         └──────────────────────────────────────┘         │
+ POST /v1/chat/completions
+          │
+          ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │                    nano-dynamo gateway                      │
+ │                                                             │
+ │  Phase 1  DispatcherProxy._push()                           │
+ │           tokenize → block hashes → kv_index overlap        │
+ │                                                             │
+ │  Phase 2  KvAwarePolicy.select()   (per prefill worker)     │
+ │    cost = prefill_cost + decode_cost + active_req_weight    │
+ │    argmin (t=0) / softmin (t>0), overlap credit             │
+ │                                                             │
+ │  Phase 3  MigrationManager.best_decode()  (per decode       │
+ │    worker, load-based — KV is transferred, 0 credit)        │
+ │                                                             │
+ │  Phase 4  PreemptionManager  LRU evict + session promote    │
+ │  Phase 5  ScalingManager     drain + auto-scale (advisory)  │
+ └───────────────┬─────────────────────────┬──────────────────┘
+                 │                         │
+                 ▼                         ▼
+        Prefill vLLM (P)             Decode vLLM (D)
+        runs prefill, 1 token        full OSL decode
+        (max_tokens=1)               (waits for blocks)
+                 │                         ▲
+                 └───── KV blocks, GPU-direct ─────┘
 ```
+
+Every request fans out to both the prefill engine (`max_tokens=1`) and the decode engine (the full generation) in parallel. The prefill engine produces one token and pushes its KV blocks to the decode engine GPU-direct via NIXL; the decode engine runs the response once the blocks arrive; the gateway streams that response back to the client. See `_push()` at `src/gateway.py:477`.
 
 ### Phases
 
-| Phase | What | Status |
-|-------|------|--------|
-| 1 | Disaggregated proxy (HTTP push to prefill + decode) | Done |
-| 2 | KV-aware routing with Dynamo cost function | Done |
-| 3 | KV Block Migration (block tracking + decode selection) | Done |
-| 4 | Preemption & promotion (LRU eviction) | Done |
-| 5 | Dynamic pool scaling (drain + auto-scale stub) | Done |
+| Phase | What | Where |
+|-------|------|-------|
+| 1 | Disaggregated proxy — tokenization, `_pick()` routing, `_push()` fan-out | `gateway.py:333`, `gateway.py:477` |
+| 2 | KV-aware prefill routing — Dynamo cost function with argmin/softmin | `gateway.py:92` (`KvAwarePolicy`) |
+| 3 | Decode selection — load-based pick across decode workers | `kvbm.py:135` (`best_decode`) |
+| 4 | Preemption & promotion — LRU eviction, promote resurrected sessions | `preemption.py:50` |
+| 5 | Dynamic scaling — drain, rebalance recommendations (advisory stub) | `scaling.py:19` |
 
-### Key files
+Key files, the cost function, what's implemented vs. missing, and an honest assessment live in [`docs/DESIGN.md`](docs/DESIGN.md).
 
-| File | Lines | What |
-|------|-------|------|
-| `src/gateway.py` | 726 | FastAPI proxy, policy, CLI |
-| `src/kvbm.py` | 181 | Block tracking + decode selection |
-| `src/kv_index.py` | 38 | Prefix overlap computation |
-| `src/kv_events.py` | 21 | Token-to-block-hash conversion |
-| `src/preemption.py` | 159 | Session promotion + eviction |
-| `src/scaling.py` | 148 | Drain + auto-scale (stub) |
-| **Total** | **1,273** | |
-
-## Cost function
+## Cost old section removed
 
 Matching what we reverse-engineered from Dynamo's `kv_router.py`:
 
@@ -196,6 +179,42 @@ python -m temp.test_nano
 pip install modal
 modal run temp/smoke_test.py
 ```
+
+## References
+
+Dynamo and disaggregated-inference background that informed this project.
+
+### Talks & videos
+
+| | Talk |
+|---|---|
+| [![YouTube](https://img.shields.io/badge/YouTube-%23FF0000?style=flat-square&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=LDN3MIjl20g) | [Dynamo: Supporting Next-Generation AI Workloads — Olga Andreeva & Ryan McCormick, NVIDIA](https://www.youtube.com/watch?v=LDN3MIjl20g) (Linux Foundation, Open Source Summit) |
+| [![YouTube](https://img.shields.io/badge/YouTube-%23FF0000?style=flat-square&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=uc6TnOszzYA&t=2459s) | [Disaggregated LLM Inference: Past, Present and Future](https://www.youtube.com/watch?v=uc6TnOszzYA&t=2459s) (GPU MODE) |
+| [![YouTube](https://img.shields.io/badge/YouTube-%23FF0000?style=flat-square&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=OuQCSOIR-Y8) | [AI Perf Benchmarking — Dynamo and Other LLM Endpoints](https://www.youtube.com/watch?v=OuQCSOIR-Y8) (NVIDIA Developer) |
+| [![YouTube](https://img.shields.io/badge/YouTube-%23FF0000?style=flat-square&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=74MUe65_P1g) | [Inside NVIDIA Dynamo: Faster, Scalable AI Deployment](https://www.youtube.com/watch?v=74MUe65_P1g) (Ray Summit 2025, Anyscale) |
+| [![YouTube](https://img.shields.io/badge/YouTube-%23FF0000?style=flat-square&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=CLzz7ZalYD8&list=PL5B692fm6--tgryKu94h2Zb7jTFM3Go4X) | [Inference Office Hours with SGLang: Performance Optimizations for LLM Serving](https://www.youtube.com/watch?v=CLzz7ZalYD8&list=PL5B692fm6--tgryKu94h2Zb7jTFM3Go4X) (NVIDIA Developer) |
+| [![YouTube](https://img.shields.io/badge/YouTube-%23FF0000?style=flat-square&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=9tvJ_GYJA-o&t=14s) | [Mastering LLM Inference Optimization: From Theory to Cost-Effective Deployment — Mark Moyou](https://www.youtube.com/watch?v=9tvJ_GYJA-o&t=14s) (AI Engineer) |
+| [![YouTube](https://img.shields.io/badge/YouTube-%23FF0000?style=flat-square&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=pCef86jKZgM&t=882s) | [NVIDIA Dynamo: High-Performance Open Source Interface — William Arnold](https://www.youtube.com/watch?v=pCef86jKZgM&t=882s) (AER Labs) |
+| [![YouTube](https://img.shields.io/badge/YouTube-%23FF0000?style=flat-square&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=BUVOCqbmy3U) | [Benchmark Any LLM in 3 Steps — NVIDIA Dynamo + GenAI Perf Tutorial](https://www.youtube.com/watch?v=BUVOCqbmy3U) (Faradawn Yang) |
+
+### Docs & articles
+
+| | Doc / Article |
+|---|---|
+| [![NVIDIA](https://img.shields.io/badge/NVIDIA-%2376B900?style=flat-square&logo=nvidia&logoColor=white)](https://developer.nvidia.com/dynamo) | [NVIDIA Dynamo — official developer page](https://developer.nvidia.com/dynamo) |
+| [![NVIDIA](https://img.shields.io/badge/NVIDIA-%2376B900?style=flat-square&logo=nvidia&logoColor=white)](https://docs.nvidia.com/dynamo/dev/knowledge-base/overview) | [Dynamo Knowledge Base: Overview](https://docs.nvidia.com/dynamo/dev/knowledge-base/overview) (NVIDIA docs) |
+| [![NVIDIA](https://img.shields.io/badge/NVIDIA-%2376B900?style=flat-square&logo=nvidia&logoColor=white)](https://docs.nvidia.com/dynamo/dev/digest/flash-indexer) | [Dynamo Digest: Flash Indexer](https://docs.nvidia.com/dynamo/dev/digest/flash-indexer) (NVIDIA docs) |
+| [![Article](https://img.shields.io/badge/Article-%23D14836?style=flat-square&logo=readthedocs&logoColor=white)](https://blog.aifoundry.org/p/nvidia-dynamo-serving-llms-at-ai) | [NVIDIA Dynamo: Serving LLMs at AI Speed](https://blog.aifoundry.org/p/nvidia-dynamo-serving-llms-at-ai) (AI Foundry) |
+| [![Article](https://img.shields.io/badge/Article-%23D14836?style=flat-square&logo=readthedocs&logoColor=white)](https://jarvislabs.ai/blog/vllm-optimization-techniques) | [vLLM Optimization Techniques](https://jarvislabs.ai/blog/vllm-optimization-techniques) (Jarvislabs) |
+| [![Article](https://img.shields.io/badge/Article-%23D14836?style=flat-square&logo=readthedocs&logoColor=white)](https://jarvislabs.ai/blog/scaling-llm-inference-dp-pp-tp) | [Scaling LLM Inference: Data Parallelism, Pipeline Parallelism, Tensor Parallelism](https://jarvislabs.ai/blog/scaling-llm-inference-dp-pp-tp) (Jarvislabs) |
+
+### Code & tools
+
+| | Repo / Gist |
+|---|---|
+| [![GitHub](https://img.shields.io/badge/GitHub-%23181717?style=flat-square&logo=github&logoColor=white)](https://github.com/ai-dynamo/dynamo) | [ai-dynamo/dynamo — NVIDIA Dynamo inference framework](https://github.com/ai-dynamo/dynamo) |
+| [![GitHub](https://img.shields.io/badge/GitHub-%23181717?style=flat-square&logo=github&logoColor=white)](https://github.com/ai-dynamo/aiperf) | [ai-dynamo/aiperf — LLM benchmarking tool](https://github.com/ai-dynamo/aiperf) |
+| [![GitHub](https://img.shields.io/badge/GitHub-%23181717?style=flat-square&logo=github&logoColor=white)](https://gist.github.com/BenHamm/31c648f7d7331c94c1f3a45859db6677) | [AIPerf: Comprehensive LLM Benchmarking — BenHamm](https://gist.github.com/BenHamm/31c648f7d7331c94c1f3a45859db6677) (GitHub Gist) |
 
 ## License
 
