@@ -2,7 +2,7 @@
 
 A KV-aware routing proxy for disaggregated LLM inference, written to be read: where NVIDIA Dynamo ships a compiled Rust router backed by CUDA kernels, this implements the same cost function in plain Python. The routing logic is the interesting part — [`src/gateway.py`](src/gateway.py), cost function at `gateway.py:92-240`.
 
-> **Flex: the entire gateway is [1,273 lines of Python](src/gateway.py) — 5 files, no C++, no CUDA kernels, no Rust. You can read all of it in an hour.**
+> **Flex: the entire gateway is [1,273 lines of Python](src/gateway.py) — 5 files, no C++, no Rust. You can read all of it in an hour.**
 
 ## Benchmark: Nano-Dynamo vs NVIDIA Dynamo
 
@@ -31,39 +31,37 @@ Full numbers and run links: [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md).
 ## Architecture
 
 ```
-                         ┌──────────────────────────────────────────────────┐
-                         │              nano-dynamo gateway                │
-                         │                                                  │
-    POST /v1/chat/completions                                              │
-         │                                                                │
-         ▼                                                                │
-     ┌──────────┐    ┌────────────────────────────────────┐              │
-     │  _pick() │───►│  Phase 2: KvAwarePolicy.select()   │              │
-     │          │    │                                    │              │
-     │ tokenize │    │  cost = prefill_cost               │              │
-     │ overlap  │    │       + decode_cost                │              │
-     │ load     │    │       + active_request_weight       │              │
-     │          │    │                                    │              │
-     │          │    │  argmin / softmin                  │              │
-     └──────────┘    └────────────────────────────────────┘              │
-         │                         │                                      │
-         │                   Phase 3: KVBM best_decode()                  │
-         │                         │                                      │
-         ▼                         ▼                                      │
-    ┌────────────────────────────────────────────────────────────┐        │
-    │  Prefill vLLM (HTTP)            Decode vLLM (HTTP)         │        │
-    │  Runs prefill, capped at        Waits for remote KV, then  │        │
-    │  1 token (max_tokens=1)         generates the full         │        │
-    │                                response (OSL tokens)       │        │
-    └────────────────────────────────────────────────────────────┘        │
-         ▲                         ▲                                      │
-         │   KV blocks pushed      │                                      │
-         │   GPU-direct via NIXL   │                                      │
-         └─────────────────────────┘                                      │
-                         ┌──────────────────────────────────────┐         │
-                         │  Phase 4: PreemptionManager          │         │
-                         │  Phase 5: ScalingManager (stub)      │         │
-                         └──────────────────────────────────────┘         │
+                         
+    POST /v1/chat/completions                                               
+         │                                                                  
+         ▼                                                                  
+     ┌──────────┐    ┌────────────────────────────────────┐                 
+     │  _pick() │───►│  Phase 2: KvAwarePolicy.select()   │                 
+     │          │    │                                    │                 
+     │ tokenize │    │  cost = prefill_cost               │                 
+     │ overlap  │    │       + decode_cost                │                 
+     │ load     │    │       + active_request_weight      │                
+     │          │    │                                    │                 
+     │          │    │  argmin / softmin                  │                 
+     └──────────┘    └────────────────────────────────────┘                 
+         │                         │                                        
+         │                   Phase 3: KVBM best_decode()                    
+         │                         │                                        
+         ▼                         ▼                                        
+    ┌────────────────────────────────────────────────────────────┐          
+    │  Prefill vLLM (HTTP)            Decode vLLM (HTTP)         │          
+    │  Runs prefill, capped at        Waits for remote KV, then  │          
+    │  1 token (max_tokens=1)         generates the full         │          
+    │                                response (OSL tokens)       │         
+    └────────────────────────────────────────────────────────────┘          
+               ▲                         ▲                                        
+               │   KV blocks pushed      │                                        
+               │   GPU-direct via NIXL   │                                        
+               └─────────────────────────┘                                        
+         ┌──────────────────────────────────────┐           
+         │  Phase 4: PreemptionManager          │           
+         │  Phase 5: ScalingManager (stub)      │           
+         └──────────────────────────────────────┘           
 ```
 
 ### Phases
@@ -104,68 +102,89 @@ logit                  = prefill_cost + decode_cost + request_cost
 
 Select argmin (temperature=0) or softmin (temperature>0). Reservoir sampling for tied minima.
 
-## What we actually have
+<details>
+<summary><strong>What we actually have</strong></summary>
 
-- Dynamo-matching cost function with configurable overlap credit, temperature, load scale, and request weight
-- Per-request config overrides via `router_config_override` in the request body
-- Overlap credit decay (reduces credit on overloaded workers proportional to excess queued blocks)
-- Prefill active token tracking across workers (counts inflight tokens)
-- Decode selection with overlap credit=0 (pure load, since KV is transferred)
-- Reservoir sampling for tie-breaking (Dynamo-equivalent)
-- Softmin routing at temperature>0 (range-normalized)
-- KV block placement tracking (radix-tree-free hash-matching)
-- Decode worker load monitoring + migration planning
-- LRU preemption with session promotion
-- Drain + auto-scale stubs
-- Push-mode KV disaggregation via vLLM's native `NixlPushConnector` (gateway orchestrates, NIXL moves blocks GPU-direct)
-- AIPerf benchmark harness (`benchmark_nano.py`) with per-phase PROF diagnostics and engine-metric breakdown
-- 16 unit checks, no GPU required (`python -m temp.test_nano`)
+* Dynamo-matching cost function with configurable overlap credit, temperature, load scale, and request weight
+* Per-request config overrides via `router_config_override` in the request body
+* Overlap credit decay (reduces credit on overloaded workers proportional to excess queued blocks)
+* Prefill active token tracking across workers (counts inflight tokens)
+* Decode selection with overlap credit=0 (pure load, since KV is transferred)
+* Reservoir sampling for tie-breaking (Dynamo-equivalent)
+* Softmin routing at temperature>0 (range-normalized)
+* KV block placement tracking (radix-tree-free hash-matching)
+* Decode worker load monitoring + migration planning
+* LRU preemption with session promotion
+* Drain + auto-scale stubs
+* Push-mode KV disaggregation via vLLM's native `NixlPushConnector` (gateway orchestrates, NIXL moves blocks GPU-direct)
+* AIPerf benchmark harness (`benchmark_nano.py`) with per-phase PROF diagnostics and engine-metric breakdown
+* 16 unit checks, no GPU required (`python -m temp.test_nano`)
 
-## What we DON'T have (vs real Dynamo)
+</details>
+
+<details>
+<summary><strong>What we DON'T have (vs real Dynamo)</strong></summary>
 
 ### KV event transport
+
 Dynamo uses NATS Core / JetStream / ZMQ for real-time, distributed KV events between workers and router. nano-dynamo is single-process in-memory. Restart the gateway, lose all state.
 
 ### GPU-direct KV transfer (NIXL)
+
 Dynamo's router integrates NIXL orchestration (NVLink/GPUDirect RDMA, zero CPU copies, multi-rail scale-out). nano-dynamo does **not** move KV itself — it delegates the transfer to vLLM's native `NixlPushConnector`, which runs on the same GPUs via UCX. On Modal (4 GPUs in one container) transfers ride intra-node NVLink; Dynamo's advantage is a production-grade, router-managed, scale-out transfer layer, not a per-request protocol difference.
 
 ### Flash Indexer
+
 Dynamo's indexer does 170M ops/s in C++/CUDA. nano-dynamo's `KvIndex` is a hash-based Python prefix matcher.
 
 ### Multi-replica router
+
 Dynamo syncs router state across replicas for HA. nano-dynamo is a single point of failure.
 
 ### Priority scheduling (`--router-queue-threshold`)
+
 Dynamo supports queue-threshold-based prioritization. nano-dynamo is FCFS-only.
 
 ### AIC prefill duration model (`--router-prefill-load-model aic`)
+
 Dynamo optionally decays only the oldest active prefill using an ML-predicted duration. nano-dynamo decays uniformly.
 
 ### Standalone indexer
+
 Dynamo can run `dynamo.indexer` as an independent service. nano-dynamo's index is embedded in the gateway process.
 
 ### Tiered KVBM offload
+
 Dynamo's KV Block Manager offloads to CPU → SSD → S3/Azure. nano-dynamo's "KVBM" is just block-location tracking + admission control.
 
 ### SLA planner
+
 Dynamo has a formal SLA-based auto-scaler. nano-dynamo's ScalingManager is an advisory stub — it emits rebalance recommendations every 10 s (`src/scaling.py`) and an external orchestrator would have to act on them.
 
 ### Kubernetes-native deployment
+
 Dynamo has CRDs, shadow-engine failover, topology-aware KV transfer. nano-dynamo is `uvicorn.run(...)`.
 
 ### Multimodal, agentic, LangChain
+
 Dynamo v1.2+ supports multimodal encode/prefill/decode, embedding cache, per-request agent priorities, SGLang subagent KV isolation. nano-dynamo is text-only; multi-turn support is limited to `conversation_id`-based KV reuse across turns.
 
 ### `--router-track-prefill-tokens` toggle
+
 Dynamo exposes this as a runtime flag. nano-dynamo hardcodes it at True.
 
-## Honest assessment
+</details>
+
+<details>
+<summary><strong>Honest assessment</strong></summary>
 
 nano-dynamo gets the **routing math** approximately right. The cost function, softmin, overlap credit, and argmin selection are faithful to what Dynamo's `kv_router.py` does.
 
 Everything else — event transport, index performance, distributed consistency, router-managed scale-out KV transfer, production readiness — is absent or replaced with a toy version. The benchmark above shows the remaining per-request gap is a ~70–80 ms Python gateway overhead against Dynamo's Rust frontend.
 
 If you want to understand the routing algorithm, read `gateway.py:92-240`. If you want to serve traffic, use real Dynamo.
+
+</details>
 
 ## Running
 
