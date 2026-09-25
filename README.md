@@ -31,37 +31,37 @@ Full numbers and run links: [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md).
 ## Architecture
 
 ```
-                                                                                                 
-                                          POST /v1/chat/completions                                               
-                                               │                                                                  
-                                               ▼                                                                  
-                                           ┌──────────┐    ┌────────────────────────────────────┐                 
-                                           │  _pick() │───►│  Phase 2: KvAwarePolicy.select()   │                 
-                                           │          │    │                                    │                 
-                                           │ tokenize │    │  cost = prefill_cost               │                 
-                                           │ overlap  │    │       + decode_cost                │                 
-                                           │ load     │    │       + active_request_weight      │                
-                                           │          │    │                                    │                 
-                                           │          │    │  argmin / softmin                  │                 
-                                           └──────────┘    └────────────────────────────────────┘                 
-                                               │                         │                                        
-                                               │                   Phase 3: KVBM best_decode()                    
-                                               │                         │                                        
-                                               ▼                         ▼                                        
-                                    ┌────────────────────────────────────────────────────────────┐          
-                                    │  Prefill vLLM (HTTP)            Decode vLLM (HTTP)         │          
-                                    │  Runs prefill, capped at        Waits for remote KV, then  │          
-                                    │  1 token (max_tokens=1)         generates the full         │          
-                                    │                                response (OSL tokens)       │         
-                                    └────────────────────────────────────────────────────────────┘          
-                                               ▲                         ▲                                        
-                                               │   KV blocks pushed      │                                        
-                                               │   GPU-direct via NIXL   │                                        
-                                               └─────────────────────────┘                                        
-                                         ┌──────────────────────────────────────┐           
-                                         │  Phase 4: PreemptionManager          │           
-                                         │  Phase 5: ScalingManager (stub)      │           
-                                         └──────────────────────────────────────┘           
+                                                                                           
+                                    POST /v1/chat/completions                                               
+                                         │                                                                  
+                                         ▼                                                                  
+                                     ┌──────────┐    ┌────────────────────────────────────┐                 
+                                     │  _pick() │───►│  Phase 2: KvAwarePolicy.select()   │                 
+                                     │          │    │                                    │                 
+                                     │ tokenize │    │  cost = prefill_cost               │                 
+                                     │ overlap  │    │       + decode_cost                │                 
+                                     │ load     │    │       + active_request_weight      │                
+                                     │          │    │                                    │                 
+                                     │          │    │  argmin / softmin                  │                 
+                                     └──────────┘    └────────────────────────────────────┘                 
+                                         │                         │                                        
+                                         │                   Phase 3: KVBM best_decode()                    
+                                         │                         │                                        
+                                         ▼                         ▼                                        
+                              ┌────────────────────────────────────────────────────────────┐          
+                              │  Prefill vLLM (HTTP)            Decode vLLM (HTTP)         │          
+                              │  Runs prefill, capped at        Waits for remote KV, then  │          
+                              │  1 token (max_tokens=1)         generates the full         │          
+                              │                                response (OSL tokens)       │         
+                              └────────────────────────────────────────────────────────────┘          
+                                         ▲                         ▲                                        
+                                         │   KV blocks pushed      │                                        
+                                         │   GPU-direct via NIXL   │                                        
+                                         └─────────────────────────┘                                        
+                                   ┌──────────────────────────────────────┐           
+                                   │  Phase 4: PreemptionManager          │           
+                                   │  Phase 5: ScalingManager (stub)      │           
+                                   └──────────────────────────────────────┘           
 ```
 
 ### Phases
