@@ -4,6 +4,47 @@ A lightweight, OpenAI-compatible disaggregated LLM serving gateway. Features KV 
 
 ![Nano Dynamo Architecture](docs/nano-dynamo-v0.png)
 
+## Why This Architecture Exists
+
+Modern LLM serving hits recurring bottlenecks:
+
+- **Prefill/decode imbalance** leaves GPUs underutilized when traffic mix shifts ([DistServe](https://arxiv.org/abs/2401.09670)).
+- **KV recomputation** increases TTFT and wastes compute when routing ignores cache overlap ([DeepSeek](https://arxiv.org/abs/2501.12948)).
+- **Memory pressure** from long contexts and concurrency exceeds HBM capacity without KV cache offloading ([Mooncake](https://kvcache-ai.github.io/Mooncake/design/mooncake-store.html), [FlexKV](https://github.com/taco-project/FlexKV), [LMCache](https://lmcache.ai/)).
+- **Dynamic demand** breaks static provisioning assumptions ([AzureTrace](https://github.com/Azure/AzurePublicDataset)).
+- **Real-world failures** (pod restart, partition, hot-spot overload) require first-class recovery behavior.
+
+This gateway addresses these constraints the way Dynamo does: by separating
+serving, control, and state propagation into explicit planes — request plane
+(`src/frontend`, `src/router`), state plane (`src/router/kv_indexer.py`,
+`src/router/slot_manager.py`), and discovery (`src/infra/discovery.py`).
+
+## Request Flow
+
+The main request path is:
+
+- **Request (S1):** HTTP client sends API request to Frontend (OpenAI-compatible server on `:8787`; official Dynamo uses `:8000`)
+- **Preprocess (S2):** Frontend preprocesses the request (applies chat template, tokenizes) and validates it
+- **Route to Prefill (S3):** PrefillRouter selects a prefill worker using KV-aware routing or load balancing
+
+**Prefill**
+
+- **Prefill (S4):** Prefill worker executes the prefill computation on the input tokens and generates KV cache
+- **Return Metadata (S5):** Prefill worker returns `disaggregated_params` containing backend-specific transfer metadata
+
+**Decode Routing**
+
+- **Route to Decode (S6):** PrefillRouter injects prefill result into decode request and routes to decode worker
+- **KV Transfer (S7):** Decode worker coordinates with prefill worker for direct GPU-to-GPU KV cache transfer via NIXL
+
+**Completion**
+
+- **Decode (S8):** Decode worker generates tokens using the transferred KV cache
+- **Response (S9):** Generated tokens stream back through Frontend for post-processing (detokenization) and delivery to Client
+
+Each stage maps to a named function in [`src/`](src/) — see the S-badge
+banners in code and [`docs/architecture.mmd`](docs/architecture.mmd).
+
 ## Benchmark: nano-dynamo vs NVIDIA Dynamo
 
 2P+2D · Qwen3-14B-FP8 · vLLM 0.26 + NIXL push · AIPerf · 4×A100. Same topology,
@@ -74,4 +115,11 @@ modal run proof_nano_dynamo_gpu.py                  # smoke test
 Routing math faithful to Dynamo's cost model (overlap credit + decay, argmin/
 softmin, load-only decode leg); event transport, index throughput, HA, and
 control plane intentionally out of scope — single process, static discovery,
-in-memory state. 
+in-memory state.
+
+## References
+
+- [NVIDIA Dynamo documentation](https://docs.nvidia.com/dynamo/) — architecture, router design, planner
+- [ai-dynamo/dynamo](https://github.com/ai-dynamo/dynamo) — the reference implementation this gateway maps to
+- [vllm-project/vllm](https://github.com/vllm-project/vllm) — prefill/decode engines + NIXL push connector
+- [ai-dynamo/aiperf](https://github.com/ai-dynamo/aiperf) — load generator behind the benchmark table 
