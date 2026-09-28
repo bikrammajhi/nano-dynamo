@@ -19,19 +19,27 @@ graph TD
     DecodeWorker --> S9["9 RESPONSE"] --> Frontend
 ```
 
+*Diagram: HTTP client → Frontend gateway (:8787) → PrefillRouter (KV-aware
+S3 prefill pick, load-only S6 decode pick) → vLLM prefill/decode workers with
+NIXL GPU-direct KV transfer → SSE stream back. Static discovery, no control
+plane. Full source: [`docs/architecture.mmd`](docs/architecture.mmd).*
+
 ## Benchmark: mini-dynamo vs NVIDIA Dynamo
 
-2P+2D · Qwen3-14B-FP8 · vLLM 0.26 + NIXL push · AIPerf · 4×A100. Same topology,
-model, and load on both systems — the only variable is the routing layer.
+2P+2D · Qwen3-14B-FP8 · vLLM 0.26-era prerelease + NIXL 1.4.1 push connector ·
+AIPerf · 4×A100 (CUDA 12.8.1 image). Same topology, model, and load on both
+systems — the only variable is the routing layer. Gateway deps pinned in
+`pyproject.toml`; Modal images float on `vllm --prerelease=allow`, so reruns
+should lock the image date if byte-identical reproduction matters.
 
 | Scenario | Metric | mini-dynamo | NVIDIA Dynamo | Gap |
 |---|---|---|---|---|
-| multi_turn (30 convs × 5 turns) | TTFT (ms) | 336 | 195 | 1.72× |
-| | Throughput (tok/s) | 353 | 405 | 1.15× |
-| | Latency (ms) | 2182 | 1992 | 1.10× |
-| mixed_workload (200 reqs) | TTFT (ms) | 304 | 247 | 1.23× |
-| | Throughput (tok/s) | 1141 | 1155 | 1.01× |
-| | Latency (ms) | 2807 | 2984 | **0.94×** |
+| multi_turn (30 convs × 5 turns) | TTFT (ms) | 336 | 195 | 1.72× slower |
+| multi_turn (30 convs × 5 turns) | Throughput (tok/s) | 353 | 405 | 1.15× lower |
+| multi_turn (30 convs × 5 turns) | Latency (ms) | 2182 | 1992 | 1.10× higher |
+| mixed_workload (200 reqs) | TTFT (ms) | 304 | 247 | 1.23× slower |
+| mixed_workload (200 reqs) | Throughput (tok/s) | 1141 | 1155 | ~parity |
+| mixed_workload (200 reqs) | Latency (ms) | 2807 | 2984 | 1.06× faster |
 
 Throughput and latency at parity; the remaining TTFT gap is Python-frontend
 overhead against Dynamo's Rust path (~70–80 ms measured) plus cold-start
@@ -58,9 +66,10 @@ Plus `tests/` (9 green, no GPU), `modal_proof.py` (10/10 on 2×A100),
 ## Run
 
 ```bash
-# verify (no GPU)
-PYTHONPATH=src uv run --with fastapi --with httpx --with xxhash \
-  --with uvicorn --with pytest --no-project python -m pytest tests/ -q
+# verify (no GPU) — versions pinned, matching pyproject.toml
+PYTHONPATH=src uv run --with fastapi==0.141.1 --with httpx==0.28.1 \
+  --with xxhash==4.0.1 --with uvicorn==0.54.0 --with pytest \
+  --no-project python -m pytest tests/ -q
 
 # serve (needs vLLM prefill :8100 + decode :8200)
 PYTHONPATH=src python -m frontend.frontend \
@@ -69,6 +78,10 @@ PYTHONPATH=src python -m frontend.frontend \
 ```
 
 ## Scope
+
+**Intended for:** algorithm research, routing-policy prototyping, and
+educational deep-dives into disaggregated serving.
+**Not for:** production traffic, multi-node clusters, or HA deployments.
 
 Routing math faithful to Dynamo's cost model (overlap credit + decay, argmin/
 softmin, load-only decode leg); event transport, index throughput, HA, and
