@@ -11,7 +11,7 @@ Reference numbers being compared against:
   NVIDIA Dynamo multi    : TTFT 195 ms, 405 tok/s, lat 1992 ms (README 08-01)
   NVIDIA Dynamo mixed    : TTFT 247 ms, 1155 tok/s, lat 2984 ms (README 08-01)
 
-Run: modal run modal_bench.py [--scenario multi_turn|mixed_workload|all|stress]
+Run: modal run bench_mini_dynamo.py [--scenario multi_turn|mixed_workload|all|stress]
 """
 from __future__ import annotations
 

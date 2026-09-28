@@ -1,4 +1,11 @@
 from __future__ import annotations
+"""AIPerf load bench for NVIDIA Dynamo 2P+2D (the reference system).
+
+Same model, engine flags, and AIPerf scenarios as bench_mini_dynamo.py so
+both sides of the comparison run identical load.
+
+Run: modal run bench_nvidia_dynamo.py [--scenario multi_turn|mixed_workload|all|stress]
+"""
 import asyncio, json, logging, os, subprocess, sys, threading, time
 from pathlib import Path
 import modal
@@ -119,6 +126,21 @@ SCENARIOS = {
             "--extra-inputs", "ignore_eos:true",
         ],
     },
+    "stress": {
+        # Same crossover probe as modal_bench.py: ISL 4k, OSL 256, conc 30.
+        "description": "Long-context high-concurrency stress (crossover probe)",
+        "cmd": lambda url, art: [
+            "aiperf", "profile", "--model", _MODEL, "--url", url,
+            "--endpoint-type", "chat", "--streaming",
+            "--synthetic-input-tokens-mean", "4096",
+            "--output-tokens-mean", "256",
+            "--concurrency", "30",
+            "--request-count", "60",
+            "--warmup-request-count", "5",
+            "--artifact-dir", art, "--tokenizer", _MODEL,
+            "--extra-inputs", "ignore_eos:true",
+        ],
+    },
 }
 
 
@@ -126,10 +148,22 @@ SCENARIOS = {
 async def run_benchmark(scenario: str = "all"):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger("benchmark")
-    hf_token = os.environ.get("HF_TOKEN")
-    dl_cmd = f"from huggingface_hub import snapshot_download; snapshot_download('{_MODEL}'" + (f", token='{hf_token}')" if hf_token else ")")
+    # Env-only HF auth (huggingface_hub reads HF_TOKEN from the secret):
+    # never interpolate the token - it leaked verbatim into Modal tracebacks
+    # before. Retry with backoff: the HF model API 504s intermittently.
+    dl_cmd = (f"from huggingface_hub import snapshot_download; "
+              f"snapshot_download('{_MODEL}')")
     log.info("Pre-downloading model...")
-    subprocess.run([sys.executable, "-c", dl_cmd], env={**os.environ, "PYTHONHASHSEED": "0"}, check=True)
+    for attempt in range(1, 4):
+        try:
+            subprocess.run([sys.executable, "-c", dl_cmd],
+                           env={**os.environ, "PYTHONHASHSEED": "0"}, check=True)
+            break
+        except subprocess.CalledProcessError:
+            log.warning("download attempt %d/3 failed", attempt)
+            if attempt == 3:
+                raise
+            time.sleep(30 * attempt)
     log.info("Model ready")
 
     results = {}

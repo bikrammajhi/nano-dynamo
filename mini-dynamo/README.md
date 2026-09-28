@@ -53,25 +53,9 @@ PYTHONPATH=src python -m frontend.frontend \
   --http-port 8787 --router-mode kv --block-size 64
 ```
 
-## Benchmark on Modal (4×A100, AIPerf)
-
-| Script | What it runs |
-|---|---|
-| `bench_mini_dynamo.py` | This gateway, 2P+2D load bench (this table's numbers) |
-| `bench_nvidia_dynamo.py` | NVIDIA Dynamo 2P+2D reference under identical load |
-| `bench_aggregated_control.py` | Single TP=4 engine control (no gateway, no transfer) |
-| `proof_mini_dynamo_gpu.py` | Functional GPU smoke proof, 1P+1D (no AIPerf) |
-
-```bash
-modal run bench_mini_dynamo.py --scenario all       # multi_turn + mixed_workload
-modal run bench_nvidia_dynamo.py --scenario all     # reference side
-modal run bench_aggregated_control.py --scenario all # control
-modal run proof_mini_dynamo_gpu.py                  # smoke test
-```
-
 ## Scope
 
 Routing math faithful to Dynamo's cost model (overlap credit + decay, argmin/
 softmin, load-only decode leg); event transport, index throughput, HA, and
 control plane intentionally out of scope — single process, static discovery,
-in-memory state. 
+in-memory state. Understand the algorithm here; serve traffic with Dynamo.

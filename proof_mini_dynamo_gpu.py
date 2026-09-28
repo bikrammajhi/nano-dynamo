@@ -12,7 +12,7 @@ frontend (:8787), Qwen3-14B-FP8, block_size 64, NIXL push mode. Proves:
 NOT a benchmark: ~10 requests, no AIPerf. Full load harness lives in
 modal_bench.py.
 
-Run: modal run modal_proof.py
+Run: modal run proof_mini_dynamo_gpu.py
 Working dir note: run from the repo root (this file mounts ./src).
 """
 from __future__ import annotations

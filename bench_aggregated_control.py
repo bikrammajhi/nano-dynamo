@@ -5,7 +5,7 @@ disaggregated runs. Answers: does disaggregation earn its complexity here,
 or does one aggregated engine match/beat it? No gateway, no transfer, no
 router - the floor every disaggregated number must clear.
 
-Run: modal run modal_aggregated.py [--scenario multi_turn|mixed_workload|all|stress]
+Run: modal run bench_aggregated_control.py [--scenario multi_turn|mixed_workload|all|stress]
 """
 from __future__ import annotations
 
