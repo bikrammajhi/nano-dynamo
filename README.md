@@ -4,6 +4,24 @@ A lightweight, OpenAI-compatible disaggregated LLM serving gateway. Features KV 
 
 ![Nano Dynamo Architecture](docs/nano-dynamo-v0.png)
 
+## Benchmark: nano-dynamo vs NVIDIA Dynamo
+
+2P+2D · Qwen3-14B-FP8 · vLLM 0.26 + NIXL push · AIPerf · 4×A100. Same topology,
+model, and load on both systems — the only variable is the routing layer.
+
+| Scenario | Metric | nano-dynamo | NVIDIA Dynamo | Gap |
+|---|---|---|---|---|
+| multi_turn (30 convs × 5 turns) | TTFT (ms) | 336 | 195 | 1.72× |
+| | Throughput (tok/s) | 353 | 405 | 1.15× |
+| | Latency (ms) | 2182 | 1992 | 1.10× |
+| mixed_workload (200 reqs) | TTFT (ms) | 304 | 247 | 1.23× |
+| | Throughput (tok/s) | 1141 | 1155 | 1.01× |
+| | Latency (ms) | 2807 | 2984 | **0.94×** |
+
+Throughput and latency at parity; the remaining TTFT gap is Python-frontend
+overhead against Dynamo's Rust path (~70–80 ms measured) plus cold-start
+accounting. Run history and per-block analysis: [`docs/blocks/`](docs/blocks/).
+
 ## Why This Architecture Exists
 
 Modern LLM serving hits recurring bottlenecks:
@@ -45,23 +63,6 @@ The main request path is:
 Each stage maps to a named function in [`src/`](src/) — see the S-badge
 banners in code and [`docs/architecture.mmd`](docs/architecture.mmd).
 
-## Benchmark: nano-dynamo vs NVIDIA Dynamo
-
-2P+2D · Qwen3-14B-FP8 · vLLM 0.26 + NIXL push · AIPerf · 4×A100. Same topology,
-model, and load on both systems — the only variable is the routing layer.
-
-| Scenario | Metric | nano-dynamo | NVIDIA Dynamo | Gap |
-|---|---|---|---|---|
-| multi_turn (30 convs × 5 turns) | TTFT (ms) | 336 | 195 | 1.72× |
-| | Throughput (tok/s) | 353 | 405 | 1.15× |
-| | Latency (ms) | 2182 | 1992 | 1.10× |
-| mixed_workload (200 reqs) | TTFT (ms) | 304 | 247 | 1.23× |
-| | Throughput (tok/s) | 1141 | 1155 | 1.01× |
-| | Latency (ms) | 2807 | 2984 | **0.94×** |
-
-Throughput and latency at parity; the remaining TTFT gap is Python-frontend
-overhead against Dynamo's Rust path (~70–80 ms measured) plus cold-start
-accounting. Run history and per-block analysis: [`docs/blocks/`](docs/blocks/).
 
 ## Size
 
