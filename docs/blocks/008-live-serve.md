@@ -1,4 +1,4 @@
-# Block 8 — Live serving: mini-dynamo runs end-to-end
+# Block 8 — Live serving: nano-dynamo runs end-to-end
 
 **Date:** 2026-09-27 · **Status:** done, verified · **Files touched:** 2 modified
 (`frontend.py`: sessions auto-wire + worker-port CLI + transport-error mapping
@@ -51,4 +51,4 @@ P0/D0; dead-decode run goes 502 → inhibited → 503 with no blind retry.
 because only HTTP statuses were mapped, and inhibition silently never matched
 because of a scheme prefix. Both are the same lesson as the rest of the log —
 state shared between two paths needs one canonical key — now with live
-evidence. mini-dynamo serves: 9/9 with real HTTP and real SSE."
+evidence. nano-dynamo serves: 9/9 with real HTTP and real SSE."

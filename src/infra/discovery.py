@@ -21,7 +21,7 @@ from typing import Dict, List
 from workers.decode_worker import DecodeWorker
 from workers.prefill_worker import PrefillWorker
 
-log = logging.getLogger("mini-dynamo.discovery")
+log = logging.getLogger("nano-dynamo.discovery")
 
 
 def default_prefill_workers() -> List[PrefillWorker]:

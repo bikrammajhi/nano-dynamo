@@ -1,8 +1,8 @@
-"""Load comparison: mini-dynamo 2P+2D under AIPerf (multi_turn + mixed_workload).
+"""Load comparison: nano-dynamo 2P+2D under AIPerf (multi_turn + mixed_workload).
 
 Same topology, model, engine flags, and AIPerf scenarios as the original
 nano-dynamo harness (2P+2D, Qwen3-14B-FP8, NIXL push) so the numbers compare
-apples-to-apples; the ONLY variable is the routing layer (mini-dynamo vs old
+apples-to-apples; the ONLY variable is the routing layer (nano-dynamo vs old
 gateway vs README's NVIDIA Dynamo).
 
 Reference numbers being compared against:
@@ -11,7 +11,7 @@ Reference numbers being compared against:
   NVIDIA Dynamo multi    : TTFT 195 ms, 405 tok/s, lat 1992 ms (README 08-01)
   NVIDIA Dynamo mixed    : TTFT 247 ms, 1155 tok/s, lat 2984 ms (README 08-01)
 
-Run: modal run bench_mini_dynamo.py [--scenario multi_turn|mixed_workload|all|stress]
+Run: modal run bench_nano_dynamo.py [--scenario multi_turn|mixed_workload|all|stress]
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ INPUT_TOKENS = 256
 OUTPUT_TOKENS = 128
 _FE_PORT = 8787
 
-_MINI_SRC = Path(__file__).resolve().parent / "src"
+_NANO_SRC = Path(__file__).resolve().parent / "src"
 
 image = (
     modal.Image.from_registry(
@@ -46,10 +46,10 @@ image = (
         "nixl", "xxhash", "transformers>=4.40", "huggingface-hub",
         "httpx", "fastapi", "uvicorn", "aiperf",
     )
-    .add_local_dir(_MINI_SRC, "/root/mini_src")
+    .add_local_dir(_NANO_SRC, "/root/nano_src")
 )
 
-app = modal.App("mini-dynamo-bench")
+app = modal.App("nano-dynamo-bench")
 
 SCENARIOS = {
     "multi_turn": {
@@ -223,7 +223,7 @@ async def run_bench(scenario: str = "all"):
                 raise RuntimeError(f"vLLM on port {port} failed")
         log.info("All 4 vLLM workers ready")
 
-        env = {**os.environ, "PYTHONPATH": "/root/mini_src",
+        env = {**os.environ, "PYTHONPATH": "/root/nano_src",
                "PYTHONHASHSEED": "0"}
         gw_cmd = (
             f"{sys.executable} -m frontend.frontend "
@@ -233,11 +233,11 @@ async def run_bench(scenario: str = "all"):
             f"--http-port {_FE_PORT} --router-mode kv "
             f"--block-size {_BLOCK_SIZE}"
         )
-        log.info("Starting mini-dynamo: %s", gw_cmd)
-        procs.append(start_process(gw_cmd, "mini", "/tmp/mini.log", env))
+        log.info("Starting nano-dynamo: %s", gw_cmd)
+        procs.append(start_process(gw_cmd, "nano", "/tmp/nano.log", env))
         if not wait_for_endpoint(_FE_PORT, "/health", timeout=180):
-            raise RuntimeError("mini-dynamo frontend failed")
-        log.info("mini-dynamo ready")
+            raise RuntimeError("nano-dynamo frontend failed")
+        log.info("nano-dynamo ready")
 
         url = f"http://localhost:{_FE_PORT}"
         to_run = SCENARIOS if scenario == "all" else {scenario: SCENARIOS[scenario]}
@@ -268,15 +268,15 @@ async def run_bench(scenario: str = "all"):
 
         # gateway PROF summary (per-request routing evidence)
         try:
-            prof = [l for l in open("/tmp/mini.log", errors="replace") if "PROF[" in l]
+            prof = [l for l in open("/tmp/nano.log", errors="replace") if "PROF[" in l]
             log.info("gateway PROF n=%d", len(prof))
             for line in prof[:3]:
                 log.info("    %s", line.strip()[:200])
         except FileNotFoundError:
-            log.warning("no /tmp/mini.log")
+            log.warning("no /tmp/nano.log")
 
     except BaseException:
-        for path in ["/tmp/mini.log"] + \
+        for path in ["/tmp/nano.log"] + \
                     [f"/tmp/vllm-prefill-{i}.log" for i in range(num_prefill)] + \
                     [f"/tmp/vllm-decode-{i}.log" for i in range(num_decode)]:
             try:
@@ -292,7 +292,7 @@ async def run_bench(scenario: str = "all"):
         kill_procs(procs)
 
     log.info("=" * 70)
-    log.info("MINI-DYNAMO LOAD BENCH: 2P+2D %s", scenario)
+    log.info("NANO-DYNAMO LOAD BENCH: 2P+2D %s", scenario)
     for name, r in all_results.items():
         log.info("  %-16s TTFT=%7.0fms tok/s=%7.0f lat=%7.0fms",
                  name, r.get("time_to_first_token", {}).get("avg", 0),
@@ -304,6 +304,6 @@ async def run_bench(scenario: str = "all"):
 
 @app.local_entrypoint()
 def main(scenario: str = "all"):
-    print(f"mini-dynamo load bench | 2P+2D | {scenario}")
+    print(f"nano-dynamo load bench | 2P+2D | {scenario}")
     results = run_bench.remote(scenario)
     print(f"Done: {list(results)}")

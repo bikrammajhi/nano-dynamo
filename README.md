@@ -2,7 +2,7 @@
 
 A lightweight, OpenAI-compatible disaggregated LLM serving gateway. Features KV cache-aware routing, NIXL-based GPU-to-GPU prefill/decode separation, and session affinity — all in pure Python with zero external orchestration dependencies.
 
-![Nano Dynamo Architecture](docs/mini-dynamo-v0.png)
+![Nano Dynamo Architecture](docs/nano-dynamo-v0.png)
 
 ## Benchmark: nano-dynamo vs NVIDIA Dynamo
 
@@ -57,16 +57,16 @@ PYTHONPATH=src python -m frontend.frontend \
 
 | Script | What it runs |
 |---|---|
-| `bench_mini_dynamo.py` | This gateway, 2P+2D load bench (this table's numbers) |
+| `bench_nano_dynamo.py` | This gateway, 2P+2D load bench (this table's numbers) |
 | `bench_nvidia_dynamo.py` | NVIDIA Dynamo 2P+2D reference under identical load |
 | `bench_aggregated_control.py` | Single TP=4 engine control (no gateway, no transfer) |
-| `proof_mini_dynamo_gpu.py` | Functional GPU smoke proof, 1P+1D (no AIPerf) |
+| `proof_nano_dynamo_gpu.py` | Functional GPU smoke proof, 1P+1D (no AIPerf) |
 
 ```bash
-modal run bench_mini_dynamo.py --scenario all       # multi_turn + mixed_workload
+modal run bench_nano_dynamo.py --scenario all       # multi_turn + mixed_workload
 modal run bench_nvidia_dynamo.py --scenario all     # reference side
 modal run bench_aggregated_control.py --scenario all # control
-modal run proof_mini_dynamo_gpu.py                  # smoke test
+modal run proof_nano_dynamo_gpu.py                  # smoke test
 ```
 
 ## Scope

@@ -1,4 +1,4 @@
-# Block 10 — Load comparison: mini-dynamo vs old gateway vs NVIDIA Dynamo
+# Block 10 — Load comparison: nano-dynamo vs old gateway vs NVIDIA Dynamo
 
 **Date:** 2026-09-28 · **Status:** done · **Run:**
 https://modal.com/apps/bikrammajhi/main/ap-VTwCMQbn75bNN7vS54MZc8
@@ -6,7 +6,7 @@ https://modal.com/apps/bikrammajhi/main/ap-VTwCMQbn75bNN7vS54MZc8
 
 ## Headline numbers (avg)
 
-| Scenario | Metric | mini-dynamo (new) | old gateway (Block 7) | NVIDIA Dynamo (README) |
+| Scenario | Metric | nano-dynamo (new) | old gateway (Block 7) | NVIDIA Dynamo (README) |
 |---|---|---|---|---|
 | multi_turn | TTFT (ms) | **336** (p50 305, p99 681) | 253 (p50 198, p99 638) | 195 |
 | | Throughput (tok/s) | **353** | 384 | 405 |
@@ -17,7 +17,7 @@ https://modal.com/apps/bikrammajhi/main/ap-VTwCMQbn75bNN7vS54MZc8
 
 ## Reading it honestly
 
-- **mixed_workload: mini wins or ties everywhere** — TTFT 304 vs 326 (old),
+- **mixed_workload: nano wins or ties everywhere** — TTFT 304 vs 326 (old),
   throughput 1141 vs 1121/1155 (within 1–2% of both), latency best of the three.
   The restructured cost path (filter→score→pick + incoming decode blocks +
   first-token release) is at least as good under mixed load.
@@ -29,7 +29,7 @@ https://modal.com/apps/bikrammajhi/main/ap-VTwCMQbn75bNN7vS54MZc8
   dynamics difference (old `_conv_worker` stickiness vs sessions bind-on-
   completion — AIPerf may not send conversation_id, making both per-request,
   but completion-timing of record paths differs).
-- **vs Dynamo:** mini lands 1.2–1.7× on TTFT, within ~3–13% on throughput —
+- **vs Dynamo:** nano lands 1.2–1.7× on TTFT, within ~3–13% on throughput —
   the same band the old gateway claimed (1.3×/3–9%). No evidence the
   restructure moved the needle either way at this load; the 70–80 ms Python
   frontend overhead thesis still stands.

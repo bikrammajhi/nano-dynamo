@@ -6,11 +6,11 @@ https://modal.com/apps/bikrammajhi/main/ap-HuCBvxTklpvoNvNCRbIUse
 ## What ran (and what did NOT)
 
 `modal run benchmark_nano.py --scenario multi_turn --num-prefill 2 --num-decode 2`
-against the **old gateway** (`src/gateway.py`), not mini-dynamo. This run
+against the **old gateway** (`src/gateway.py`), not nano-dynamo. This run
 establishes the current-harness baseline (CUDA 12.8.1 image, today's deps) that
-any future mini-dynamo GPU run must match. Mini-dynamo has served mocked
+any future nano-dynamo GPU run must match. Nano-dynamo has served mocked
 traffic only — claiming parity for it would require pointing this same harness
-at `mini-dynamo/` (open future work; needs a serving entry + sessions wiring
+at `nano-dynamo/` (open future work; needs a serving entry + sessions wiring
 in `create_app`).
 
 Harness hardening applied first (see plan): snapshot-download retry ×3 with
@@ -44,4 +44,4 @@ orchestration reproduce.
 "I re-ran the head-to-head baseline before claiming anything about the
 restructure: 253 ms vs 264 ms TTFT, throughput +3.5%, latency identical.
 And I'm explicit about what it does NOT prove — the old gateway served this
-traffic, mini-dynamo hasn't yet. The honest scope boundary is part of the result."
+traffic, nano-dynamo hasn't yet. The honest scope boundary is part of the result."

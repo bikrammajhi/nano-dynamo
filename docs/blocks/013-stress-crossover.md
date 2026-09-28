@@ -7,7 +7,7 @@ AIPerf ISL-mean 4096 / OSL 256 / conc 30 / 60 reqs, both architectures.
 
 | System | TTFT avg (ms) | TTFT p50 / p90 (ms) | tok/s | Lat avg (ms) |
 |---|---|---|---|---|
-| mini-dynamo 2P+2D | **18,699** | 7,859 / 49,457 | **219** | 22,819 |
+| nano-dynamo 2P+2D | **18,699** | 7,859 / 49,457 | **219** | 22,819 |
 | Aggregated TP=4 | **2,310** | — | **815** | 9,297 |
 
 ## Verdict

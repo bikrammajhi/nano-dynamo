@@ -37,7 +37,7 @@ image = (
     .pip_install("huggingface-hub", "aiperf")
 )
 
-app = modal.App("mini-dynamo-aggregated")
+app = modal.App("nano-dynamo-aggregated")
 
 SCENARIOS = {
     "multi_turn": {

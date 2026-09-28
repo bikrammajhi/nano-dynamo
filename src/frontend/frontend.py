@@ -35,7 +35,7 @@ from infra.kv_events import token_ids_to_block_hashes
 from router.prefill_router import Route, RoutingError
 from workers.prefill_worker import producer_body
 
-log = logging.getLogger("mini-dynamo.frontend")
+log = logging.getLogger("nano-dynamo.frontend")
 
 # One POST primitive for both sinks (merge of old _forward_stream/_drain):
 # eager-POST upstream, return an async chunk iterator. Draining discards it,
@@ -385,7 +385,7 @@ def create_app(model: str = "Qwen/Qwen3-14B-FP8", router_mode: str = "kv",
         prefill = discovery.worker_discovery("prefill")
         if prefill:
             frontend.models_source_url = f"http://{prefill[0].url}"
-    app = FastAPI(title="mini-dynamo")
+    app = FastAPI(title="nano-dynamo")
     app.state.frontend = frontend
 
     @app.get("/health")
@@ -448,12 +448,12 @@ def main(argv: list[str] | None = None) -> None:
     # Entry-point owns log config (library import must NOT configure logging:
     # without this, root stays WARNING and every log.info in this package -
     # PUSH lines, PROF lines, routing evidence - is silently dropped.
-    # Found by GPU proof: /tmp/mini.log had zero PROF lines while serving
+    # Found by GPU proof: /tmp/nano.log had zero PROF lines while serving
     # 200s, because nothing ever set root to INFO.)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
 
-    parser = argparse.ArgumentParser(description="mini-dynamo Frontend (S1/S2/S9)")
+    parser = argparse.ArgumentParser(description="nano-dynamo Frontend (S1/S2/S9)")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-14B-FP8")
     parser.add_argument("--http-port", type=int, default=8787)
     parser.add_argument("--host", type=str, default="0.0.0.0")

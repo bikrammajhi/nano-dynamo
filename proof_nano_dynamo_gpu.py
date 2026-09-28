@@ -1,6 +1,6 @@
-"""GPU proof: mini-dynamo serving real traffic on real vLLM engines (Modal, 2xA100).
+"""GPU proof: nano-dynamo serving real traffic on real vLLM engines (Modal, 2xA100).
 
-Topology: 1 prefill (GPU0 :8100) + 1 decode (GPU1 :8200) + mini-dynamo
+Topology: 1 prefill (GPU0 :8100) + 1 decode (GPU1 :8200) + nano-dynamo
 frontend (:8787), Qwen3-14B-FP8, block_size 64, NIXL push mode. Proves:
   1. preprocess with the REAL tokenizer (HF configs, no stub)
   2. S3/S6 routing against live engines (PROF lines name P/D workers)
@@ -12,7 +12,7 @@ frontend (:8787), Qwen3-14B-FP8, block_size 64, NIXL push mode. Proves:
 NOT a benchmark: ~10 requests, no AIPerf. Full load harness lives in
 modal_bench.py.
 
-Run: modal run proof_mini_dynamo_gpu.py
+Run: modal run proof_nano_dynamo_gpu.py
 Working dir note: run from the repo root (this file mounts ./src).
 """
 from __future__ import annotations
@@ -33,7 +33,7 @@ _BLOCK_SIZE = 64
 _MAX_MODEL_LEN = 32768
 _FE_PORT = 8787
 
-_MINI_SRC = Path(__file__).resolve().parent / "src"  # repo ./src
+_NANO_SRC = Path(__file__).resolve().parent / "src"  # repo ./src
 
 image = (
     modal.Image.from_registry(
@@ -45,10 +45,10 @@ image = (
         "nixl", "xxhash", "transformers>=4.40", "huggingface-hub",
         "httpx", "fastapi", "uvicorn",
     )
-    .add_local_dir(_MINI_SRC, "/root/mini_src")
+    .add_local_dir(_NANO_SRC, "/root/nano_src")
 )
 
-app = modal.App("mini-dynamo-proof")
+app = modal.App("nano-dynamo-proof")
 
 
 def start_process(cmd, name, log_file=None, env=None):
@@ -162,19 +162,19 @@ async def gpu_proof():
                 raise RuntimeError(f"vLLM on port {port} failed to start")
         log.info("Both vLLM workers ready")
 
-        # 3. mini-dynamo frontend (production code, real tokenizer)
-        env = {**os.environ, "PYTHONPATH": "/root/mini_src",
+        # 3. nano-dynamo frontend (production code, real tokenizer)
+        env = {**os.environ, "PYTHONPATH": "/root/nano_src",
                "PYTHONHASHSEED": "0"}
         gw_cmd = (
             f"{sys.executable} -m frontend.frontend "
             f"--model {_MODEL} --prefill-ports 8100 --decode-ports 8200 "
             f"--http-port {_FE_PORT} --router-mode kv --block-size {_BLOCK_SIZE}"
         )
-        log.info("Starting mini-dynamo: %s", gw_cmd)
-        procs.append(start_process(gw_cmd, "mini", "/tmp/mini.log", env))
+        log.info("Starting nano-dynamo: %s", gw_cmd)
+        procs.append(start_process(gw_cmd, "nano", "/tmp/nano.log", env))
         if not wait_for_endpoint(_FE_PORT, "/health", timeout=120):
-            raise RuntimeError("mini-dynamo frontend failed to start")
-        log.info("mini-dynamo ready")
+            raise RuntimeError("nano-dynamo frontend failed to start")
+        log.info("nano-dynamo ready")
         time.sleep(5)  # tokenizer lazy-loads on first request; warm it below
 
         import httpx
@@ -240,12 +240,12 @@ async def gpu_proof():
             check("kvbm status", r.status_code == 200, r.text[:160])
 
         # 4. gateway-log evidence: PROF lines name P/D workers per request
-        prof = [l for l in open("/tmp/mini.log", errors="replace")
+        prof = [l for l in open("/tmp/nano.log", errors="replace")
                 if "PROF[" in l]
         check("PROF lines emitted", len(prof) >= 4, f"n={len(prof)}")
         for line in prof[:5]:
             log.info("    %s", line.strip()[:200])
-        routed = [l for l in open("/tmp/mini.log", errors="replace")
+        routed = [l for l in open("/tmp/nano.log", errors="replace")
                   if "KVBM route" in l or "KV_ROUTE" in l]
         check("routing evidence in log", len(routed) >= 1, f"n={len(routed)}")
 
@@ -253,7 +253,7 @@ async def gpu_proof():
         # Failure diagnostics: a blind GPU allocation teaches nothing. Dump
         # gateway + worker tails (and which procs already exited) before the
         # traceback, so the next run starts from evidence.
-        for path in ["/tmp/mini.log", "/tmp/vllm-prefill.log", "/tmp/vllm-decode.log"]:
+        for path in ["/tmp/nano.log", "/tmp/vllm-prefill.log", "/tmp/vllm-decode.log"]:
             try:
                 with open(path, errors="replace") as fh:
                     lines = fh.read().splitlines()
@@ -273,7 +273,7 @@ async def gpu_proof():
 
     passed = sum(1 for c in results["checks"] if c["pass"])
     log.info("=" * 60)
-    log.info("MINI-DYNAMO GPU PROOF: %d/%d checks passed",
+    log.info("NANO-DYNAMO GPU PROOF: %d/%d checks passed",
              passed, len(results["checks"]))
     log.info("=" * 60)
     return results
@@ -281,7 +281,7 @@ async def gpu_proof():
 
 @app.local_entrypoint()
 def main():
-    print("mini-dynamo GPU proof: 1P+1D, Qwen3-14B-FP8, functional traffic")
+    print("nano-dynamo GPU proof: 1P+1D, Qwen3-14B-FP8, functional traffic")
     result = gpu_proof.remote()
     n = sum(1 for c in result["checks"] if c["pass"])
     print(f"Result: {n}/{len(result['checks'])} passed")

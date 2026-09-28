@@ -1,6 +1,6 @@
-# Block 9 — GPU proof: mini-dynamo serves real traffic on 2×A100
+# Block 9 — GPU proof: nano-dynamo serves real traffic on 2×A100
 
-**Date:** 2026-09-27 · **Status:** 10/10 PASS · **Run:** Modal `mini-dynamo-proof`
+**Date:** 2026-09-27 · **Status:** 10/10 PASS · **Run:** Modal `nano-dynamo-proof`
 (1 prefill GPU0 :8100 + 1 decode GPU1 :8200, Qwen3-14B-FP8, block 64, NIXL push)
 
 ## Result
@@ -36,11 +36,11 @@ under concurrency 10; same regime, different load point.)
    failures at load are capacity questions. Order matters for the bill.
 2. **Failure log-dumps added to `modal_proof.py` first** (gateway + worker
    tails, proc exit codes on any failed check). E9.2 was diagnosed from the
-   decode-side error text in the dumped mini.log, not from the status code.
+   decode-side error text in the dumped nano.log, not from the status code.
 3. **No benchmark claimed.** ~10 requests prove serving correctness
    (routing, caps, affinity, accounting, observability). Throughput/TTFT
    authority stays with `benchmark_nano.py` (Block 7: 253 ms) until a load
-   harness points at mini-dynamo.
+   harness points at nano-dynamo.
 
 ## Interview note
 

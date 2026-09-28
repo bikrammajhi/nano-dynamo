@@ -1,7 +1,7 @@
 from __future__ import annotations
 """AIPerf load bench for NVIDIA Dynamo 2P+2D (the reference system).
 
-Same model, engine flags, and AIPerf scenarios as bench_mini_dynamo.py so
+Same model, engine flags, and AIPerf scenarios as bench_nano_dynamo.py so
 both sides of the comparison run identical load.
 
 Run: modal run bench_nvidia_dynamo.py [--scenario multi_turn|mixed_workload|all|stress]

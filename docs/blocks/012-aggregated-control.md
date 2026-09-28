@@ -5,7 +5,7 @@ prefix caching on, same 4×A100 / model / AIPerf scenarios, no gateway.
 
 ## Numbers
 
-| Scenario | Metric | Aggregated TP=4 | mini-dynamo 2P+2D | Old gateway | NVIDIA Dynamo |
+| Scenario | Metric | Aggregated TP=4 | nano-dynamo 2P+2D | Old gateway | NVIDIA Dynamo |
 |---|---|---|---|---|---|
 | multi_turn | TTFT (ms) | **95** | 336 | 253–264 | 195 |
 | | tok/s | **569** | 353 | 384 | 405 |

@@ -66,5 +66,5 @@ compute split, transfer-as-fraction-of-TTFT. A system can win TTFT and lose ITL
 
 Blocks 7/9/10 numbers are frontend-overhead measurements (Python vs Rust
 per-request cost), not routing-quality measurements. Any sentence of the form
-"mini-dynamo routes within X of Dynamo" should read "mini-dynamo SERVES within
+"nano-dynamo routes within X of Dynamo" should read "nano-dynamo SERVES within
 X of Dynamo at 2P+2D, light load, NVLink" until the matrix above says otherwise.

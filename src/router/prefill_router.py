@@ -34,7 +34,7 @@ from infra.kv_events import token_ids_to_block_hashes
 from router.kv_indexer import KvIndexer
 from router.slot_manager import SlotManager
 
-log = logging.getLogger("mini-dynamo.router")
+log = logging.getLogger("nano-dynamo.router")
 
 ROUTER_MODES = ("round-robin", "random", "kv")
 
