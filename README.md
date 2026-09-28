@@ -65,6 +65,9 @@ accounting. Run history and per-block analysis: [`docs/blocks/`](docs/blocks/).
 
 ## Size
 
+<details>
+<summary>Module line counts (click to expand)</summary>
+
 | Module | Lines | Diagram element |
 |---|---|---|
 | `src/frontend/frontend.py` | 500 | Frontend (S1/S2/S4–S9) |
@@ -78,21 +81,10 @@ accounting. Run history and per-block analysis: [`docs/blocks/`](docs/blocks/).
 | `src/infra/kv_events.py` | 30 | Block hashing |
 | **Total** | **1,261** | |
 
-Plus `tests/` (9 green, no GPU), `modal_proof.py` (10/10 on 2×A100),
-`modal_bench.py` (this table's harness).
+Plus `tests/` (9 green, no GPU), `proof_nano_dynamo_gpu.py` (10/10 on 2×A100),
+`bench_nano_dynamo.py` (this table's harness).
 
-## Run
-
-```bash
-# verify (no GPU)
-PYTHONPATH=src uv run --with fastapi --with httpx --with xxhash \
-  --with uvicorn --with pytest --no-project python -m pytest tests/ -q
-
-# serve (needs vLLM prefill :8100 + decode :8200)
-PYTHONPATH=src python -m frontend.frontend \
-  --model Qwen/Qwen3-14B-FP8 --prefill-ports 8100 --decode-ports 8200 \
-  --http-port 8787 --router-mode kv --block-size 64
-```
+</details>
 
 ## Benchmark on Modal (4×A100, AIPerf)
 
@@ -110,12 +102,18 @@ modal run bench_aggregated_control.py --scenario all # control
 modal run proof_nano_dynamo_gpu.py                  # smoke test
 ```
 
-## Scope
+## Test
 
-Routing math faithful to Dynamo's cost model (overlap credit + decay, argmin/
-softmin, load-only decode leg); event transport, index throughput, HA, and
-control plane intentionally out of scope — single process, static discovery,
-in-memory state.
+```bash
+# verify (no GPU)
+PYTHONPATH=src uv run --with fastapi --with httpx --with xxhash \
+  --with uvicorn --with pytest --no-project python -m pytest tests/ -q
+
+# serve (needs vLLM prefill :8100 + decode :8200)
+PYTHONPATH=src python -m frontend.frontend \
+  --model Qwen/Qwen3-14B-FP8 --prefill-ports 8100 --decode-ports 8200 \
+  --http-port 8787 --router-mode kv --block-size 64
+```
 
 ## References
 
