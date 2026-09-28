@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kv-prefix-router"
-version = "0.1.0"
-description = "Educational HTTP proxy demonstrating prefix-aware LLM request routing via radix tree and cost function"
+name = "mini-dynamo"
+version = "1.0.0"
+description = "KV-aware routing proxy for disaggregated LLM inference, structured as a readable map of NVIDIA Dynamo's architecture"
 requires-python = ">=3.10"
 
 dependencies = [
@@ -14,10 +14,11 @@ dependencies = [
     "uvicorn[standard]",
     "httpx",
     "transformers",
-    "pyzmq",
-    "pydantic>=2.0",
-    "sse-starlette>=2.0",
 ]
+
+[project.optional-dependencies]
+bench = ["aiperf", "modal"]
+test = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -12,7 +12,7 @@ _TOTAL_GPUS = _NUM_PREFILL + _NUM_DECODE
 FRONTEND_PORT = 8000
 
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04", add_python="3.12")
+    modal.Image.from_registry("nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04", add_python="3.12")
     .apt_install("git", "wget", "curl", "build-essential")
     .uv_pip_install("vllm", pre="--prerelease=allow")
     .uv_pip_install("ai-dynamo[vllm]", pre="--prerelease=allow")
